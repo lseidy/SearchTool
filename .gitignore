@@ -1,0 +1,17 @@
+# Ignora todos os arquivos JSON (Protege suas credenciais do Google)
+*.json
+
+# Ignora arquivos de variáveis de ambiente (Onde você vai colocar o Token do Telegram)
+.env
+
+# Ignora a pasta do ambiente virtual do Python (se você estiver usando uma)
+venv/
+env/
+.venv/
+
+# Ignora arquivos de cache do Python (deixa o repositório mais leve)
+__pycache__/
+*.pyc
+
+# Ignora pastas de cache do Playwright
+.playwright/
