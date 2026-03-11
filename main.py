@@ -33,6 +33,45 @@ DEFAULT_USER_AGENT = (
 )
 
 
+def get_proxy_settings() -> Optional[Dict[str, str]]:
+    server = os.getenv("SCRAPER_PROXY_SERVER", "").strip()
+    username = os.getenv("SCRAPER_PROXY_USERNAME", "").strip()
+    password = os.getenv("SCRAPER_PROXY_PASSWORD", "").strip()
+
+    if not server:
+        return None
+
+    settings: Dict[str, str] = {"server": server}
+    if username:
+        settings["username"] = username
+    if password:
+        settings["password"] = password
+    return settings
+
+
+def get_requests_session() -> requests.Session:
+    session = requests.Session()
+    proxy_server = os.getenv("SCRAPER_PROXY_SERVER", "").strip()
+    proxy_user = os.getenv("SCRAPER_PROXY_USERNAME", "").strip()
+    proxy_pass = os.getenv("SCRAPER_PROXY_PASSWORD", "").strip()
+
+    if proxy_server:
+        if proxy_user and proxy_pass and "@" not in proxy_server:
+            parts = proxy_server.split("://", 1)
+            if len(parts) == 2:
+                scheme, host = parts
+                proxy_url = f"{scheme}://{proxy_user}:{proxy_pass}@{host}"
+            else:
+                proxy_url = proxy_server
+        else:
+            proxy_url = proxy_server
+
+        session.proxies.update({"http": proxy_url, "https": proxy_url})
+        logger.info("Proxy habilitado para requests.")
+
+    return session
+
+
 @dataclass
 class Product:
     name: str
@@ -123,8 +162,10 @@ def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
     endpoint = "https://api.mercadolibre.com/sites/MLB/search"
     logger.info("Tentando fallback pela API pública do Mercado Livre.")
 
+    session = get_requests_session()
+
     try:
-        response = requests.get(
+        response = session.get(
             endpoint,
             params={"q": keyword, "limit": limit},
             timeout=30,
@@ -178,8 +219,10 @@ def scrape_mercadolivre_http(keyword: str, limit: int) -> List[Product]:
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     }
 
+    session = get_requests_session()
+
     try:
-        response = requests.get(search_url, headers=headers, timeout=30)
+        response = session.get(search_url, headers=headers, timeout=30)
     except requests.RequestException as exc:
         logger.warning("Falha ao buscar HTML da listagem: %s", exc)
         return []
@@ -232,7 +275,7 @@ def scrape_mercadolivre_http(keyword: str, limit: int) -> List[Product]:
     products: List[Product] = []
     for url in links:
         try:
-            detail = requests.get(url, headers=headers, timeout=30)
+            detail = session.get(url, headers=headers, timeout=30)
         except requests.RequestException:
             continue
 
@@ -344,9 +387,17 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
 
     with sync_playwright() as p:
         headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
+        launch_args = {
+            "headless": headless,
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        }
+        proxy_settings = get_proxy_settings()
+        if proxy_settings:
+            launch_args["proxy"] = proxy_settings
+            logger.info("Proxy habilitado para Playwright.")
+
         browser = p.chromium.launch(
-            headless=headless,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            **launch_args,
         )
         context = build_browser_context(browser)
         page = context.new_page()
@@ -468,10 +519,15 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
 def scrape_product_detail(url: str, fallback_title: str) -> Optional[Product]:
     with sync_playwright() as p:
         headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
-        browser = p.chromium.launch(
-            headless=headless,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-        )
+        launch_args = {
+            "headless": headless,
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        }
+        proxy_settings = get_proxy_settings()
+        if proxy_settings:
+            launch_args["proxy"] = proxy_settings
+
+        browser = p.chromium.launch(**launch_args)
         context = build_browser_context(browser)
         page = context.new_page()
 

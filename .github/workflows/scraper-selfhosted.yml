@@ -1,11 +1,13 @@
-name: Buscador de Preços
+name: Buscador de Preços (Self-hosted)
 
 on:
+  schedule:
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 jobs:
-  run-scraper:
-    runs-on: ubuntu-latest
+  run-scraper-selfhosted:
+    runs-on: [self-hosted, Windows, X64]
 
     steps:
       - name: Checkout
@@ -22,7 +24,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Install Playwright Chromium
-        run: playwright install --with-deps chromium
+        run: playwright install chromium
 
       - name: Run scraper
         env:
