@@ -26,6 +26,13 @@ logging.basicConfig(
 logger = logging.getLogger("buscador-precos")
 
 
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
 @dataclass
 class Product:
     name: str
@@ -112,6 +119,15 @@ def build_search_url(keyword: str) -> str:
     return f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}"
 
 
+def build_browser_context(browser):
+    return browser.new_context(
+        locale="pt-BR",
+        timezone_id="America/Sao_Paulo",
+        user_agent=os.getenv("BROWSER_USER_AGENT", DEFAULT_USER_AGENT),
+        viewport={"width": 1366, "height": 768},
+    )
+
+
 def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
     search_url = build_search_url(keyword)
     products: List[Dict[str, str]] = []
@@ -121,15 +137,37 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        context = build_browser_context(browser)
+        page = context.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2500)
 
         cards = page.query_selector_all("li.ui-search-layout__item")
 
+        if not cards:
+            logger.warning("Nenhum card encontrado com seletor principal. Tentando fallback por links.")
+            fallback_links = page.query_selector_all("a.poly-component__title, a.ui-search-link")
+            for link_el in fallback_links:
+                url = normalize_url(link_el.get_attribute("href") or "")
+                if not url or url in seen_urls:
+                    continue
+                if not re.search(r"/MLB-", url, re.IGNORECASE):
+                    continue
+                title = (link_el.inner_text() or "Produto").strip()
+                products.append({"url": url, "title": title})
+                seen_urls.add(url)
+                if len(products) >= limit:
+                    break
+            context.close()
+            browser.close()
+            logger.info("URLs coletadas (fallback): %d", len(products))
+            return products
+
         for card in cards:
-            link_el = card.query_selector("a.ui-search-link")
-            title_el = card.query_selector("h3")
+            link_el = card.query_selector("a.ui-search-link") or card.query_selector("a.poly-component__title")
+            title_el = card.query_selector("h3") or card.query_selector("a.poly-component__title")
+            fraction_el = card.query_selector("span.andes-money-amount__fraction")
+            cents_el = card.query_selector("span.andes-money-amount__cents")
 
             if not link_el:
                 continue
@@ -145,12 +183,20 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
 
             title = (title_el.inner_text().strip() if title_el else "Produto")
 
-            products.append({"url": url, "title": title})
+            price_text = None
+            if fraction_el:
+                fraction = (fraction_el.inner_text() or "").strip()
+                cents = (cents_el.inner_text() or "00").strip() if cents_el else "00"
+                if fraction:
+                    price_text = f"{fraction},{cents or '00'}"
+
+            products.append({"url": url, "title": title, "price_text": price_text})
             seen_urls.add(url)
 
             if len(products) >= limit:
                 break
 
+        context.close()
         browser.close()
 
     logger.info("URLs coletadas: %d", len(products))
@@ -160,13 +206,15 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
 def scrape_product_detail(url: str, fallback_title: str) -> Optional[Product]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        context = build_browser_context(browser)
+        page = context.new_page()
 
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(2000)
         except PlaywrightTimeoutError:
             logger.warning("Timeout ao abrir produto: %s", url)
+            context.close()
             browser.close()
             return None
 
@@ -218,6 +266,7 @@ def scrape_product_detail(url: str, fallback_title: str) -> Optional[Product]:
                 if price_value is not None:
                     break
 
+        context.close()
         browser.close()
 
         if price_value is None:
@@ -235,6 +284,15 @@ def scrape_mercadolivre(keyword: str, limit: int) -> List[Product]:
         product = scrape_product_detail(entry["url"], entry["title"])
         if product:
             items.append(product)
+            continue
+
+        # fallback: tenta extrair preço da página de busca quando o detalhe falha
+        logger.warning("Fallback para preço via busca: %s", entry["url"])
+        fallback_price = parse_price_to_float(entry.get("price_text") or "")
+        if fallback_price is not None:
+            items.append(
+                Product(name=entry["title"], price=fallback_price, url=entry["url"])
+            )
 
     logger.info("Produtos válidos extraídos: %d", len(items))
     return items

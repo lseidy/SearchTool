@@ -24,7 +24,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Install Playwright Chromium
-        run: playwright install chromium
+        run: playwright install --with-deps chromium
 
       - name: Run scraper
         env:
@@ -36,4 +36,5 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DATA_SHEET_NAME: "Historico"
           TARGET_SHEET_NAME: "PrecosAlvo"
+          LOG_LEVEL: "INFO"
         run: python main.py
