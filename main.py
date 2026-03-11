@@ -119,6 +119,46 @@ def build_search_url(keyword: str) -> str:
     return f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}"
 
 
+def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
+    endpoint = "https://api.mercadolibre.com/sites/MLB/search"
+    logger.info("Tentando fallback pela API pública do Mercado Livre.")
+
+    response = requests.get(
+        endpoint,
+        params={"q": keyword, "limit": limit},
+        timeout=30,
+        headers={"User-Agent": os.getenv("BROWSER_USER_AGENT", DEFAULT_USER_AGENT)},
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    results = payload.get("results", []) if isinstance(payload, dict) else []
+
+    products: List[Product] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+
+        title = str(item.get("title", "") or "").strip()
+        permalink = normalize_url(str(item.get("permalink", "") or ""))
+        price_raw = item.get("price")
+
+        if not title or not permalink:
+            continue
+
+        price = safe_float(price_raw)
+        if price is None:
+            continue
+
+        products.append(Product(name=title, price=price, url=permalink))
+
+        if len(products) >= limit:
+            break
+
+    logger.info("Produtos coletados via API: %d", len(products))
+    return products
+
+
 def extract_products_from_ldjson(html: str, limit: int) -> List[Dict[str, str]]:
     products: List[Dict[str, str]] = []
     seen = set()
@@ -347,6 +387,11 @@ def scrape_product_detail(url: str, fallback_title: str) -> Optional[Product]:
 
 def scrape_mercadolivre(keyword: str, limit: int) -> List[Product]:
     links = scrape_top_product_links(keyword, limit)
+
+    if not links:
+        logger.warning("Sem links pela interface web. Usando fallback API.")
+        return scrape_mercadolivre_api(keyword, limit)
+
     items: List[Product] = []
 
     for entry in links:
@@ -362,6 +407,10 @@ def scrape_mercadolivre(keyword: str, limit: int) -> List[Product]:
             items.append(
                 Product(name=entry["title"], price=fallback_price, url=entry["url"])
             )
+
+    if not items:
+        logger.warning("Sem produtos válidos pelo Playwright. Usando fallback API.")
+        return scrape_mercadolivre_api(keyword, limit)
 
     logger.info("Produtos válidos extraídos: %d", len(items))
     return items
