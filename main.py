@@ -192,6 +192,26 @@ def scrape_mercadolivre_http(keyword: str, limit: int) -> List[Product]:
     links = []
     seen = set()
 
+    # padrão principal atual do Mercado Livre (poly-component__title)
+    for match in re.finditer(
+        r'<a[^>]*class=["\'][^"\']*poly-component__title[^"\']*["\'][^>]*href=["\']([^"\']+)["\']',
+        html,
+        flags=re.IGNORECASE,
+    ):
+        raw_url = match.group(1).replace("&amp;", "&")
+        url = normalize_url(raw_url)
+        if not url:
+            continue
+        if url.startswith("/"):
+            url = f"https://www.mercadolivre.com.br{url}"
+        if url in seen:
+            continue
+        seen.add(url)
+        links.append(url)
+        if len(links) >= limit:
+            break
+
+    # fallback genérico por links contendo MLB
     for match in re.finditer(r'href=["\']([^"\']*?/MLB-[^"\']+)["\']', html, flags=re.IGNORECASE):
         url = normalize_url(match.group(1))
         if not url:
@@ -331,16 +351,52 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
         context = build_browser_context(browser)
         page = context.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_selector(
+                "a.poly-component__title, a.ui-search-link, li.ui-search-layout__item, div.poly-card__content",
+                timeout=15000,
+            )
+        except PlaywrightTimeoutError:
+            logger.warning("Timeout aguardando resultados da busca.")
         page.wait_for_timeout(2500)
         logger.info("Título da página de busca: %s", page.title())
 
         html = page.content()
+        lower_html = html.lower()
+        bot_markers = [
+            "pardon our interruption",
+            "unusual traffic",
+            "verify you are human",
+            "captcha",
+            "acesso negado",
+            "cloudflare",
+        ]
+        if any(marker in lower_html for marker in bot_markers):
+            logger.warning("Possível bloqueio anti-bot detectado na página de busca.")
+
         ldjson_products = extract_products_from_ldjson(html, limit)
         if ldjson_products:
             logger.info("URLs coletadas via JSON-LD: %d", len(ldjson_products))
             context.close()
             browser.close()
             return ldjson_products
+
+        poly_links = page.query_selector_all("a.poly-component__title")
+        for link_el in poly_links:
+            url = normalize_url(link_el.get_attribute("href") or "")
+            if not url or url in seen_urls:
+                continue
+            title = (link_el.inner_text() or "Produto").strip()
+            products.append({"url": url, "title": title, "price_text": None})
+            seen_urls.add(url)
+            if len(products) >= limit:
+                break
+
+        if products:
+            context.close()
+            browser.close()
+            logger.info("URLs coletadas (poly): %d", len(products))
+            return products
 
         cards = page.query_selector_all("li.ui-search-layout__item")
 
