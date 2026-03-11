@@ -28,7 +28,7 @@ jobs:
 
       - name: Run scraper
         env:
-          SEARCH_KEYWORD: "Monitor 144hz"
+          SEARCH_KEYWORD: "Monitor"
           TOP_N_RESULTS: "5"
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
