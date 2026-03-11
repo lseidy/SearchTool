@@ -37,4 +37,5 @@ jobs:
           DATA_SHEET_NAME: "Historico"
           TARGET_SHEET_NAME: "PrecosAlvo"
           LOG_LEVEL: "INFO"
+          PLAYWRIGHT_HEADLESS: "false"
         run: python main.py

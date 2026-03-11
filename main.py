@@ -123,13 +123,23 @@ def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
     endpoint = "https://api.mercadolibre.com/sites/MLB/search"
     logger.info("Tentando fallback pela API pública do Mercado Livre.")
 
-    response = requests.get(
-        endpoint,
-        params={"q": keyword, "limit": limit},
-        timeout=30,
-        headers={"User-Agent": os.getenv("BROWSER_USER_AGENT", DEFAULT_USER_AGENT)},
-    )
-    response.raise_for_status()
+    try:
+        response = requests.get(
+            endpoint,
+            params={"q": keyword, "limit": limit},
+            timeout=30,
+            headers={"User-Agent": os.getenv("BROWSER_USER_AGENT", DEFAULT_USER_AGENT)},
+        )
+    except requests.RequestException as exc:
+        logger.warning("Falha de rede na API do Mercado Livre: %s", exc)
+        return []
+
+    if response.status_code >= 300:
+        logger.warning(
+            "API do Mercado Livre respondeu %s. Fallback API ignorado.",
+            response.status_code,
+        )
+        return []
 
     payload = response.json()
     results = payload.get("results", []) if isinstance(payload, dict) else []
@@ -156,6 +166,89 @@ def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
             break
 
     logger.info("Produtos coletados via API: %d", len(products))
+    return products
+
+
+def scrape_mercadolivre_http(keyword: str, limit: int) -> List[Product]:
+    logger.info("Tentando fallback por HTML via requests.")
+    search_url = build_search_url(keyword)
+
+    headers = {
+        "User-Agent": os.getenv("BROWSER_USER_AGENT", DEFAULT_USER_AGENT),
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    try:
+        response = requests.get(search_url, headers=headers, timeout=30)
+    except requests.RequestException as exc:
+        logger.warning("Falha ao buscar HTML da listagem: %s", exc)
+        return []
+
+    if response.status_code >= 300:
+        logger.warning("Listagem HTML respondeu %s.", response.status_code)
+        return []
+
+    html = response.text
+    links = []
+    seen = set()
+
+    for match in re.finditer(r'href=["\']([^"\']*?/MLB-[^"\']+)["\']', html, flags=re.IGNORECASE):
+        url = normalize_url(match.group(1))
+        if not url:
+            continue
+        if url.startswith("/"):
+            url = f"https://www.mercadolivre.com.br{url}"
+        if url in seen:
+            continue
+        seen.add(url)
+        links.append(url)
+        if len(links) >= limit:
+            break
+
+    if not links:
+        logger.warning("Fallback HTML não encontrou links de produtos.")
+        return []
+
+    products: List[Product] = []
+    for url in links:
+        try:
+            detail = requests.get(url, headers=headers, timeout=30)
+        except requests.RequestException:
+            continue
+
+        if detail.status_code >= 300:
+            continue
+
+        page_html = detail.text
+        title = None
+        price = None
+
+        ldjson_products = extract_products_from_ldjson(page_html, limit=1)
+        if ldjson_products:
+            title = ldjson_products[0].get("title")
+            price = parse_price_to_float(ldjson_products[0].get("price_text") or "")
+
+        if not title:
+            title_match = re.search(r"<h1[^>]*>(.*?)</h1>", page_html, flags=re.IGNORECASE | re.DOTALL)
+            if title_match:
+                title = re.sub(r"<[^>]+>", "", title_match.group(1)).strip()
+
+        if price is None:
+            meta_price_match = re.search(
+                r'<meta[^>]+itemprop=["\']price["\'][^>]+content=["\']([^"\']+)["\']',
+                page_html,
+                flags=re.IGNORECASE,
+            )
+            if meta_price_match:
+                price = parse_price_to_float(meta_price_match.group(1))
+
+        if title and price is not None:
+            products.append(Product(name=title, price=price, url=url))
+
+        if len(products) >= limit:
+            break
+
+    logger.info("Produtos coletados via HTML requests: %d", len(products))
     return products
 
 
@@ -230,7 +323,11 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
     logger.info("Abrindo página de busca: %s", search_url)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
+        browser = p.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
         context = build_browser_context(browser)
         page = context.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
@@ -314,7 +411,11 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
 
 def scrape_product_detail(url: str, fallback_title: str) -> Optional[Product]:
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
+        browser = p.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
         context = build_browser_context(browser)
         page = context.new_page()
 
@@ -390,7 +491,11 @@ def scrape_mercadolivre(keyword: str, limit: int) -> List[Product]:
 
     if not links:
         logger.warning("Sem links pela interface web. Usando fallback API.")
-        return scrape_mercadolivre_api(keyword, limit)
+        api_items = scrape_mercadolivre_api(keyword, limit)
+        if api_items:
+            return api_items
+        logger.warning("Fallback API sem resultados. Tentando fallback HTML requests.")
+        return scrape_mercadolivre_http(keyword, limit)
 
     items: List[Product] = []
 
@@ -410,7 +515,11 @@ def scrape_mercadolivre(keyword: str, limit: int) -> List[Product]:
 
     if not items:
         logger.warning("Sem produtos válidos pelo Playwright. Usando fallback API.")
-        return scrape_mercadolivre_api(keyword, limit)
+        api_items = scrape_mercadolivre_api(keyword, limit)
+        if api_items:
+            return api_items
+        logger.warning("Fallback API sem resultados. Tentando fallback HTML requests.")
+        return scrape_mercadolivre_http(keyword, limit)
 
     logger.info("Produtos válidos extraídos: %d", len(items))
     return items
