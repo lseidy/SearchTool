@@ -119,6 +119,60 @@ def build_search_url(keyword: str) -> str:
     return f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}"
 
 
+def extract_products_from_ldjson(html: str, limit: int) -> List[Dict[str, str]]:
+    products: List[Dict[str, str]] = []
+    seen = set()
+
+    scripts = re.findall(
+        r"<script[^>]*type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    for raw in scripts:
+        raw = raw.strip()
+        if not raw:
+            continue
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        blocks = data if isinstance(data, list) else [data]
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+
+            items = block.get("itemListElement")
+            if not isinstance(items, list):
+                continue
+
+            for entry in items:
+                item = entry.get("item", {}) if isinstance(entry, dict) else {}
+                if not isinstance(item, dict):
+                    continue
+
+                url = normalize_url(str(item.get("url", "") or ""))
+                name = str(item.get("name", "") or "").strip() or "Produto"
+                price = None
+
+                offers = item.get("offers")
+                if isinstance(offers, dict):
+                    price = str(offers.get("price", "") or "").strip()
+
+                if not url or url in seen or not re.search(r"/MLB-", url, re.IGNORECASE):
+                    continue
+
+                products.append({"url": url, "title": name, "price_text": price})
+                seen.add(url)
+
+                if len(products) >= limit:
+                    return products
+
+    return products
+
+
 def build_browser_context(browser):
     return browser.new_context(
         locale="pt-BR",
@@ -141,23 +195,38 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
         page = context.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2500)
+        logger.info("Título da página de busca: %s", page.title())
+
+        html = page.content()
+        ldjson_products = extract_products_from_ldjson(html, limit)
+        if ldjson_products:
+            logger.info("URLs coletadas via JSON-LD: %d", len(ldjson_products))
+            context.close()
+            browser.close()
+            return ldjson_products
 
         cards = page.query_selector_all("li.ui-search-layout__item")
 
         if not cards:
             logger.warning("Nenhum card encontrado com seletor principal. Tentando fallback por links.")
-            fallback_links = page.query_selector_all("a.poly-component__title, a.ui-search-link")
-            for link_el in fallback_links:
-                url = normalize_url(link_el.get_attribute("href") or "")
+            fallback_links = page.eval_on_selector_all(
+                "a[href*='/MLB-']",
+                "els => els.map(e => ({ href: e.href || '', text: (e.textContent || '').trim() }))",
+            )
+
+            for link in fallback_links:
+                url = normalize_url(str(link.get("href", "") or ""))
                 if not url or url in seen_urls:
                     continue
                 if not re.search(r"/MLB-", url, re.IGNORECASE):
                     continue
-                title = (link_el.inner_text() or "Produto").strip()
-                products.append({"url": url, "title": title})
+
+                title = (str(link.get("text", "") or "").strip() or "Produto")
+                products.append({"url": url, "title": title, "price_text": None})
                 seen_urls.add(url)
                 if len(products) >= limit:
                     break
+
             context.close()
             browser.close()
             logger.info("URLs coletadas (fallback): %d", len(products))
