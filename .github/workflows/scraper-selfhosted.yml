@@ -7,46 +7,26 @@ on:
 
 jobs:
   run-scraper-selfhosted:
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: [self-hosted, Linux, X64]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate local Python
-        shell: cmd
-        run: |
-          where py
-          if %ERRORLEVEL% EQU 0 (
-            py -3.11 --version
-          ) else (
-            python --version
-          )
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Install dependencies
-        shell: cmd
         run: |
-          where py
-          if %ERRORLEVEL% EQU 0 (
-            py -3.11 -m pip install --upgrade pip
-            py -3.11 -m pip install -r requirements.txt
-          ) else (
-            python -m pip install --upgrade pip
-            python -m pip install -r requirements.txt
-          )
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Install Playwright Chromium
-        shell: cmd
-        run: |
-          where py
-          if %ERRORLEVEL% EQU 0 (
-            py -3.11 -m playwright install chromium
-          ) else (
-            python -m playwright install chromium
-          )
+        run: playwright install --with-deps chromium
 
       - name: Run scraper
-        shell: cmd
         env:
           SEARCH_KEYWORD: "Monitor"
           TOP_N_RESULTS: "5"
@@ -61,10 +41,4 @@ jobs:
           SCRAPER_PROXY_SERVER: ${{ secrets.SCRAPER_PROXY_SERVER }}
           SCRAPER_PROXY_USERNAME: ${{ secrets.SCRAPER_PROXY_USERNAME }}
           SCRAPER_PROXY_PASSWORD: ${{ secrets.SCRAPER_PROXY_PASSWORD }}
-        run: |
-          where py
-          if %ERRORLEVEL% EQU 0 (
-            py -3.11 main.py
-          ) else (
-            python main.py
-          )
+        run: python main.py
