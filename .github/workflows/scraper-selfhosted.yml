@@ -13,26 +13,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Allow PowerShell scripts (runner user)
-        shell: powershell
+      - name: Validate local Python
+        shell: cmd
         run: |
-          Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-          Get-ExecutionPolicy -List
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+          where py
+          if %ERRORLEVEL% EQU 0 (
+            py -3.11 --version
+          ) else (
+            python --version
+          )
 
       - name: Install dependencies
+        shell: cmd
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          where py
+          if %ERRORLEVEL% EQU 0 (
+            py -3.11 -m pip install --upgrade pip
+            py -3.11 -m pip install -r requirements.txt
+          ) else (
+            python -m pip install --upgrade pip
+            python -m pip install -r requirements.txt
+          )
 
       - name: Install Playwright Chromium
-        run: playwright install chromium
+        shell: cmd
+        run: |
+          where py
+          if %ERRORLEVEL% EQU 0 (
+            py -3.11 -m playwright install chromium
+          ) else (
+            python -m playwright install chromium
+          )
 
       - name: Run scraper
+        shell: cmd
         env:
           SEARCH_KEYWORD: "Monitor"
           TOP_N_RESULTS: "5"
@@ -47,4 +61,10 @@ jobs:
           SCRAPER_PROXY_SERVER: ${{ secrets.SCRAPER_PROXY_SERVER }}
           SCRAPER_PROXY_USERNAME: ${{ secrets.SCRAPER_PROXY_USERNAME }}
           SCRAPER_PROXY_PASSWORD: ${{ secrets.SCRAPER_PROXY_PASSWORD }}
-        run: python main.py
+        run: |
+          where py
+          if %ERRORLEVEL% EQU 0 (
+            py -3.11 main.py
+          ) else (
+            python main.py
+          )
