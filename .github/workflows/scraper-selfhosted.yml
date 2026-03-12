@@ -13,6 +13,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Allow PowerShell scripts (runner user)
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
+          Get-ExecutionPolicy -List
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
