@@ -741,7 +741,27 @@ def send_telegram_message(token: str, chat_id: str, message: str) -> None:
 
 def process_products(config: AppConfig, products: List[Product]) -> None:
     gc = get_gspread_client()
-    sh = gc.open_by_key(config.google_sheet_id)
+    try:
+        sh = gc.open_by_key(config.google_sheet_id)
+    except gspread.exceptions.SpreadsheetNotFound as exc:
+        raise RuntimeError(
+            "Planilha não encontrada ou sem permissão. Verifique GOOGLE_SHEET_ID e compartilhe a planilha com o e-mail da service account."
+        ) from exc
+    except gspread.exceptions.APIError as exc:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        content_type = response.headers.get("Content-Type", "") if response is not None else ""
+        body_preview = (response.text or "")[:400] if response is not None else ""
+
+        logger.error(
+            "Falha Google Sheets API | status=%s | content-type=%s | body-preview=%s",
+            status_code,
+            content_type,
+            body_preview,
+        )
+        raise RuntimeError(
+            "Falha ao acessar Google Sheets. Verifique GOOGLE_CREDENTIALS, GOOGLE_SHEET_ID, APIs do Google habilitadas e permissões da service account."
+        ) from exc
 
     data_ws = sh.worksheet(config.data_sheet_name)
 
