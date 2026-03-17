@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -37,6 +38,19 @@ TITLE_BLACKLIST_EXACT = {
     "loja oficial",
     "ofertas",
     "mercado livre",
+}
+
+SEARCH_STOPWORDS = {
+    "de",
+    "do",
+    "da",
+    "dos",
+    "das",
+    "e",
+    "com",
+    "para",
+    "a",
+    "o",
 }
 
 
@@ -99,19 +113,26 @@ class AppConfig:
     telegram_enabled: bool
 
 
-def load_config() -> AppConfig:
+def parse_search_keywords() -> List[str]:
     raw_keywords = os.getenv("SEARCH_KEYWORDS", "").strip()
-    if raw_keywords:
-        parsed_keywords = [
-            part.strip()
-            for part in re.split(r"[,;|\n]+", raw_keywords)
-            if part.strip()
-        ]
-    else:
-        parsed_keywords = []
+    fallback = os.getenv("SEARCH_KEYWORD", "Monitor 144hz").strip()
 
-    search_keyword = os.getenv("SEARCH_KEYWORD", "Monitor 144hz").strip()
-    search_keywords = parsed_keywords if parsed_keywords else [search_keyword]
+    if not raw_keywords:
+        return [fallback]
+
+    parsed = [
+        part.strip(" \t\r\n|,;/-")
+        for part in re.split(r"[,;|\n]+", raw_keywords)
+        if part.strip()
+    ]
+    parsed = [term for term in parsed if term and term not in {"/", "-", "_"}]
+
+    return parsed if parsed else [fallback]
+
+
+def load_config() -> AppConfig:
+    search_keywords = parse_search_keywords()
+    search_keyword = search_keywords[0]
     top_n = int(os.getenv("TOP_N_RESULTS", "5"))
 
     google_sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
@@ -214,6 +235,44 @@ def sanitize_products(products: List[Product]) -> List[Product]:
         sanitized.append(Product(name=title, price=price, url=url))
 
     return sanitized
+
+
+def normalize_text(text: str) -> str:
+    ascii_text = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii")
+    normalized = re.sub(r"[^a-zA-Z0-9\s]", " ", ascii_text.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def tokenize_search_term(search_keyword: str) -> List[str]:
+    tokens = normalize_text(search_keyword).split()
+    return [t for t in tokens if t not in SEARCH_STOPWORDS and len(t) >= 2]
+
+
+def relevance_score(title: str, keyword_tokens: List[str]) -> int:
+    title_tokens = set(normalize_text(title).split())
+    return sum(1 for token in keyword_tokens if token in title_tokens)
+
+
+def filter_relevant_products(products: List[Product], search_keyword: str) -> List[Product]:
+    keyword_tokens = tokenize_search_term(search_keyword)
+    if not keyword_tokens:
+        return products
+
+    scored = [
+        (product, relevance_score(product.name, keyword_tokens))
+        for product in products
+    ]
+
+    high_relevance = [product for product, score in scored if score >= 2]
+    if high_relevance:
+        return high_relevance
+
+    medium_relevance = [product for product, score in scored if score >= 1]
+    if medium_relevance:
+        return medium_relevance
+
+    return products
 
 
 def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
@@ -890,6 +949,7 @@ def process_products(config: AppConfig, products: List[Product], search_keyword:
         data_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
 
     valid_products = sanitize_products(products)
+    valid_products = filter_relevant_products(valid_products, search_keyword)
     if not valid_products:
         logger.warning("Nenhum produto válido após sanitização.")
         return
