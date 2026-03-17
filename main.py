@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 from urllib.parse import quote_plus
 
 import gspread
+import pandas as pd
 import requests
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
@@ -31,6 +32,12 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+
+TITLE_BLACKLIST_EXACT = {
+    "loja oficial",
+    "ofertas",
+    "mercado livre",
+}
 
 
 def get_proxy_settings() -> Optional[Dict[str, str]]:
@@ -155,7 +162,45 @@ def normalize_url(url: str) -> str:
 
 
 def build_search_url(keyword: str) -> str:
-    return f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}"
+    return f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}_OrderId_PRICE"
+
+
+def normalize_title_for_match(title: str) -> str:
+    normalized = re.sub(r"[^\w\s]", " ", (title or "").strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def is_valid_product_url(url: str) -> bool:
+    return bool(url and "/MLB-" in url)
+
+
+def is_blacklisted_title(title: str) -> bool:
+    return normalize_title_for_match(title) in TITLE_BLACKLIST_EXACT
+
+
+def sanitize_products(products: List[Product]) -> List[Product]:
+    sanitized: List[Product] = []
+    seen_urls = set()
+
+    for product in products:
+        url = normalize_url(product.url)
+        price = safe_float(product.price)
+        title = (product.name or "").strip()
+
+        if not is_valid_product_url(url):
+            continue
+        if price is None or price <= 0.0:
+            continue
+        if not title or is_blacklisted_title(title):
+            continue
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+        sanitized.append(Product(name=title, price=price, url=url))
+
+    return sanitized
 
 
 def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
@@ -206,7 +251,8 @@ def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
         if len(products) >= limit:
             break
 
-    logger.info("Produtos coletados via API: %d", len(products))
+    products = sanitize_products(products)
+    logger.info("Produtos coletados via API (sanitizados): %d", len(products))
     return products
 
 
@@ -311,7 +357,8 @@ def scrape_mercadolivre_http(keyword: str, limit: int) -> List[Product]:
         if len(products) >= limit:
             break
 
-    logger.info("Produtos coletados via HTML requests: %d", len(products))
+    products = sanitize_products(products)
+    logger.info("Produtos coletados via HTML requests (sanitizados): %d", len(products))
     return products
 
 
@@ -605,9 +652,9 @@ def scrape_mercadolivre(keyword: str, limit: int) -> List[Product]:
         logger.warning("Sem links pela interface web. Usando fallback API.")
         api_items = scrape_mercadolivre_api(keyword, limit)
         if api_items:
-            return api_items
+            return sanitize_products(api_items)
         logger.warning("Fallback API sem resultados. Tentando fallback HTML requests.")
-        return scrape_mercadolivre_http(keyword, limit)
+        return sanitize_products(scrape_mercadolivre_http(keyword, limit))
 
     items: List[Product] = []
 
@@ -629,11 +676,12 @@ def scrape_mercadolivre(keyword: str, limit: int) -> List[Product]:
         logger.warning("Sem produtos válidos pelo Playwright. Usando fallback API.")
         api_items = scrape_mercadolivre_api(keyword, limit)
         if api_items:
-            return api_items
+            return sanitize_products(api_items)
         logger.warning("Fallback API sem resultados. Tentando fallback HTML requests.")
-        return scrape_mercadolivre_http(keyword, limit)
+        return sanitize_products(scrape_mercadolivre_http(keyword, limit))
 
-    logger.info("Produtos válidos extraídos: %d", len(items))
+    items = sanitize_products(items)
+    logger.info("Produtos válidos extraídos (sanitizados): %d", len(items))
     return items
 
 
@@ -651,6 +699,38 @@ def get_gspread_client():
     raise ValueError(
         "Defina GOOGLE_CREDENTIALS (JSON da service account) ou GOOGLE_CREDENTIALS_FILE (caminho)."
     )
+
+
+def log_google_sheets_preflight(gc, sheet_id: str) -> None:
+    try:
+        creds = getattr(gc, "auth", None)
+        if creds is None:
+            logger.error("Diagnóstico Google Sheets: credenciais ausentes no cliente gspread.")
+            return
+
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+
+        creds.refresh(GoogleAuthRequest())
+        token = getattr(creds, "token", None)
+        if not token:
+            logger.error("Diagnóstico Google Sheets: token OAuth não foi gerado.")
+            return
+
+        endpoint = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}?includeGridData=false"
+        response = requests.get(
+            endpoint,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+
+        logger.error(
+            "Diagnóstico Google Sheets preflight | status=%s | content-type=%s | body-preview=%s",
+            response.status_code,
+            response.headers.get("Content-Type", ""),
+            (response.text or "")[:400],
+        )
+    except Exception as diag_exc:
+        logger.error("Falha no diagnóstico Google Sheets preflight: %s", diag_exc)
 
 
 def safe_float(value: str) -> Optional[float]:
@@ -759,46 +839,118 @@ def process_products(config: AppConfig, products: List[Product]) -> None:
             content_type,
             body_preview,
         )
+        log_google_sheets_preflight(gc, config.google_sheet_id)
         raise RuntimeError(
             "Falha ao acessar Google Sheets. Verifique GOOGLE_CREDENTIALS, GOOGLE_SHEET_ID, APIs do Google habilitadas e permissões da service account."
         ) from exc
+    except requests.exceptions.JSONDecodeError as exc:
+        logger.error(
+            "Google Sheets retornou resposta não-JSON. Possível bloqueio de rede/proxy, credencial inválida ou endpoint inesperado."
+        )
+        log_google_sheets_preflight(gc, config.google_sheet_id)
+        raise RuntimeError(
+            "Resposta inválida da Google Sheets API. Verifique rede/proxy do runner, GOOGLE_CREDENTIALS e permissões da planilha."
+        ) from exc
+    except Exception as exc:
+        logger.error("Erro inesperado ao abrir planilha: %s", exc)
+        log_google_sheets_preflight(gc, config.google_sheet_id)
+        raise
 
     data_ws = sh.worksheet(config.data_sheet_name)
 
-    try:
-        target_ws = sh.worksheet(config.target_sheet_name)
-    except gspread.exceptions.WorksheetNotFound:
-        logger.warning(
-            "A aba '%s' não foi encontrada. Será usado somente histórico.",
-            config.target_sheet_name,
-        )
-        target_ws = None
+    expected_headers = [
+        "Data/Hora",
+        "Termo Buscado",
+        "Preço Atual",
+        "Preço Médio",
+        "Menor Preço Histórico",
+        "Variação (%)",
+        "Link do Menor Preço Atual",
+    ]
 
+    current_headers = data_ws.row_values(1)
+    if current_headers != expected_headers:
+        data_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
+
+    valid_products = sanitize_products(products)
+    if not valid_products:
+        logger.warning("Nenhum produto válido após sanitização.")
+        return
+
+    df = pd.DataFrame(
+        [{"name": p.name, "price": p.price, "url": p.url} for p in valid_products]
+    )
+
+    if df.empty:
+        logger.warning("DataFrame vazio após processamento.")
+        return
+
+    min_idx = df["price"].idxmin()
+    current_price = float(df.loc[min_idx, "price"])
+    average_price = float(df["price"].mean())
+    current_link = str(df.loc[min_idx, "url"])
     timestamp = now_brt_str()
 
-    rows_to_append = []
-    for product in products:
-        rows_to_append.append([timestamp, product.name, product.price, product.url])
+    rows = data_ws.get_all_records()
+    keyword_key = config.search_keyword.strip().lower()
 
-        target_price = get_target_price(target_ws, product)
-        last_price = get_last_price(data_ws, product)
+    existing_row_index = None
+    existing_row = None
+    for idx, row in enumerate(rows, start=2):
+        term = str(row.get("Termo Buscado", "") or "").strip().lower()
+        if term == keyword_key:
+            existing_row_index = idx
+            existing_row = row
+            break
 
-        reference_price = target_price if target_price is not None else last_price
+    variation_pct = 0.0
+    historical_min = current_price
+    previous_historical_min = None
 
-        if reference_price is not None and product.price < reference_price:
-            message = (
-                f"🚨 Preço caiu! {product.name} está custando R$ {brl(product.price)} "
-                f"aqui: {product.url}"
-            )
-            if config.telegram_enabled:
-                send_telegram_message(config.telegram_token, config.telegram_chat_id, message)
-                logger.info("Alerta enviado para: %s", product.name)
-            else:
-                logger.info("Telegram desabilitado. Mensagem gerada: %s", message)
+    if existing_row is not None:
+        previous_historical_min = safe_float(existing_row.get("Menor Preço Histórico"))
+        if previous_historical_min is not None and previous_historical_min > 0:
+            variation_pct = ((current_price - previous_historical_min) / previous_historical_min) * 100
+            historical_min = min(current_price, previous_historical_min)
+        else:
+            variation_pct = 0.0
+            historical_min = current_price
 
-    if rows_to_append:
-        data_ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-        logger.info("%d linhas inseridas na planilha.", len(rows_to_append))
+    payload = [
+        timestamp,
+        config.search_keyword,
+        current_price,
+        average_price,
+        historical_min,
+        variation_pct,
+        current_link,
+    ]
+
+    if existing_row_index is None:
+        data_ws.append_row(payload, value_input_option="USER_ENTERED")
+        logger.info("Novo termo inserido no histórico: %s", config.search_keyword)
+    else:
+        data_ws.update(
+            f"A{existing_row_index}:G{existing_row_index}",
+            [payload],
+            value_input_option="USER_ENTERED",
+        )
+        logger.info("Termo atualizado no histórico: %s", config.search_keyword)
+
+    if existing_row is not None and variation_pct < 0:
+        old_reference = previous_historical_min if previous_historical_min is not None else historical_min
+        message = (
+            f"📉 Novo recorde de preço para '{config.search_keyword}'!\n"
+            f"Preço atual: R$ {brl(current_price)}\n"
+            f"Recorde anterior: R$ {brl(old_reference)}\n"
+            f"Variação: {variation_pct:.2f}%\n"
+            f"Link: {current_link}"
+        )
+        if config.telegram_enabled:
+            send_telegram_message(config.telegram_token, config.telegram_chat_id, message)
+            logger.info("Alerta de novo menor preço enviado.")
+        else:
+            logger.info("Telegram desabilitado. Mensagem gerada: %s", message)
 
 
 def main() -> int:
