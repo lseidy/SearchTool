@@ -89,6 +89,7 @@ class Product:
 @dataclass
 class AppConfig:
     search_keyword: str
+    search_keywords: List[str]
     top_n: int
     google_sheet_id: str
     data_sheet_name: str
@@ -99,7 +100,18 @@ class AppConfig:
 
 
 def load_config() -> AppConfig:
+    raw_keywords = os.getenv("SEARCH_KEYWORDS", "").strip()
+    if raw_keywords:
+        parsed_keywords = [
+            part.strip()
+            for part in re.split(r"[,;|\n]+", raw_keywords)
+            if part.strip()
+        ]
+    else:
+        parsed_keywords = []
+
     search_keyword = os.getenv("SEARCH_KEYWORD", "Monitor 144hz").strip()
+    search_keywords = parsed_keywords if parsed_keywords else [search_keyword]
     top_n = int(os.getenv("TOP_N_RESULTS", "5"))
 
     google_sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
@@ -113,6 +125,7 @@ def load_config() -> AppConfig:
 
     return AppConfig(
         search_keyword=search_keyword,
+        search_keywords=search_keywords,
         top_n=top_n,
         google_sheet_id=google_sheet_id,
         data_sheet_name=os.getenv("DATA_SHEET_NAME", "Historico").strip(),
@@ -212,7 +225,7 @@ def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
     try:
         response = session.get(
             endpoint,
-            params={"q": keyword, "limit": limit},
+            params={"q": keyword, "limit": limit, "sort": "price_asc"},
             timeout=30,
             headers={"User-Agent": os.getenv("BROWSER_USER_AGENT", DEFAULT_USER_AGENT)},
         )
@@ -482,7 +495,11 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
         poly_links = page.query_selector_all("a.poly-component__title")
         for link_el in poly_links:
             url = normalize_url(link_el.get_attribute("href") or "")
+            if url.startswith("/"):
+                url = f"https://www.mercadolivre.com.br{url}"
             if not url or url in seen_urls:
+                continue
+            if not re.search(r"/MLB-", url, re.IGNORECASE):
                 continue
             title = (link_el.inner_text() or "Produto").strip()
             products.append({"url": url, "title": title, "price_text": None})
@@ -819,7 +836,7 @@ def send_telegram_message(token: str, chat_id: str, message: str) -> None:
         raise RuntimeError(f"Erro no Telegram: {response.status_code} - {response.text}")
 
 
-def process_products(config: AppConfig, products: List[Product]) -> None:
+def process_products(config: AppConfig, products: List[Product], search_keyword: str) -> None:
     gc = get_gspread_client()
     try:
         sh = gc.open_by_key(config.google_sheet_id)
@@ -892,7 +909,7 @@ def process_products(config: AppConfig, products: List[Product]) -> None:
     timestamp = now_brt_str()
 
     rows = data_ws.get_all_records()
-    keyword_key = config.search_keyword.strip().lower()
+    keyword_key = search_keyword.strip().lower()
 
     existing_row_index = None
     existing_row = None
@@ -918,7 +935,7 @@ def process_products(config: AppConfig, products: List[Product]) -> None:
 
     payload = [
         timestamp,
-        config.search_keyword,
+        search_keyword,
         current_price,
         average_price,
         historical_min,
@@ -928,19 +945,19 @@ def process_products(config: AppConfig, products: List[Product]) -> None:
 
     if existing_row_index is None:
         data_ws.append_row(payload, value_input_option="USER_ENTERED")
-        logger.info("Novo termo inserido no histórico: %s", config.search_keyword)
+        logger.info("Novo termo inserido no histórico: %s", search_keyword)
     else:
         data_ws.update(
             f"A{existing_row_index}:G{existing_row_index}",
             [payload],
             value_input_option="USER_ENTERED",
         )
-        logger.info("Termo atualizado no histórico: %s", config.search_keyword)
+        logger.info("Termo atualizado no histórico: %s", search_keyword)
 
     if existing_row is not None and variation_pct < 0:
         old_reference = previous_historical_min if previous_historical_min is not None else historical_min
         message = (
-            f"📉 Novo recorde de preço para '{config.search_keyword}'!\n"
+            f"📉 Novo recorde de preço para '{search_keyword}'!\n"
             f"Preço atual: R$ {brl(current_price)}\n"
             f"Recorde anterior: R$ {brl(old_reference)}\n"
             f"Variação: {variation_pct:.2f}%\n"
@@ -956,13 +973,23 @@ def process_products(config: AppConfig, products: List[Product]) -> None:
 def main() -> int:
     try:
         config = load_config()
-        products = scrape_mercadolivre(config.search_keyword, config.top_n)
+        processed_any_term = False
 
-        if not products:
-            logger.warning("Nenhum produto foi extraído.")
+        for keyword in config.search_keywords:
+            logger.info("Iniciando busca para termo: %s", keyword)
+            products = scrape_mercadolivre(keyword, config.top_n)
+
+            if not products:
+                logger.warning("Nenhum produto foi extraído para o termo: %s", keyword)
+                continue
+
+            process_products(config, products, keyword)
+            processed_any_term = True
+
+        if not processed_any_term:
+            logger.warning("Nenhum termo retornou produtos válidos.")
             return 0
 
-        process_products(config, products)
         logger.info("Execução finalizada com sucesso.")
         return 0
 
