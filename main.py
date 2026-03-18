@@ -92,6 +92,8 @@ class AppConfig:
     search_keyword: str
     search_keywords: List[str]
     top_n: int
+    calibration_top_n: int
+    monitor_top_n: int
     min_price_threshold: float
     google_sheet_id: str
     data_sheet_name: str
@@ -122,6 +124,9 @@ def load_config() -> AppConfig:
     search_keywords = parse_search_keywords()
     search_keyword = search_keywords[0]
     top_n = int(os.getenv("TOP_N_RESULTS", "5"))
+    calibration_top_n = int(os.getenv("CALIBRATION_TOP_N", "50"))
+    monitor_top_n = int(os.getenv("MONITOR_TOP_N", "5"))
+    monitor_top_n = max(1, min(monitor_top_n, 5))
     min_price_threshold = float(os.getenv("MIN_PRICE_THRESHOLD", "0"))
 
     google_sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
@@ -137,6 +142,8 @@ def load_config() -> AppConfig:
         search_keyword=search_keyword,
         search_keywords=search_keywords,
         top_n=top_n,
+        calibration_top_n=calibration_top_n,
+        monitor_top_n=monitor_top_n,
         min_price_threshold=min_price_threshold,
         google_sheet_id=google_sheet_id,
         data_sheet_name=os.getenv("DATA_SHEET_NAME", "Historico").strip(),
@@ -185,8 +192,22 @@ def normalize_url(url: str) -> str:
     return url.split("#")[0].split("?")[0].strip()
 
 
-def build_search_url(keyword: str) -> str:
-    return f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}_OrderId_PRICE"
+def format_price_range_for_url(price_min: Optional[float], price_max: Optional[float]) -> str:
+    if price_min is None or price_max is None:
+        return ""
+
+    min_int = max(0, int(round(price_min)))
+    max_int = max(min_int, int(round(price_max)))
+    return f"_PriceRange_{min_int}-{max_int}"
+
+
+def build_search_url(
+    keyword: str,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+) -> str:
+    price_range_part = format_price_range_for_url(price_min, price_max)
+    return f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}_OrderId_PRICE{price_range_part}"
 
 
 def normalize_title_for_match(title: str) -> str:
@@ -265,16 +286,27 @@ def filter_valid_products(
     return validated
 
 
-def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
+def scrape_mercadolivre_api(
+    keyword: str,
+    limit: int,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+) -> List[Product]:
     endpoint = "https://api.mercadolibre.com/sites/MLB/search"
     logger.info("Tentando fallback pela API pública do Mercado Livre.")
 
     session = get_requests_session()
 
     try:
+        params = {"q": keyword, "limit": limit, "sort": "price_asc"}
+        if price_min is not None and price_max is not None:
+            min_int = max(0, int(round(price_min)))
+            max_int = max(min_int, int(round(price_max)))
+            params["price"] = f"{min_int}-{max_int}"
+
         response = session.get(
             endpoint,
-            params={"q": keyword, "limit": limit, "sort": "price_asc"},
+            params=params,
             timeout=30,
             headers={"User-Agent": os.getenv("BROWSER_USER_AGENT", DEFAULT_USER_AGENT)},
         )
@@ -318,9 +350,14 @@ def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
     return products
 
 
-def scrape_mercadolivre_http(keyword: str, limit: int) -> List[Product]:
+def scrape_mercadolivre_http(
+    keyword: str,
+    limit: int,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+) -> List[Product]:
     logger.info("Tentando fallback por HTML via requests.")
-    search_url = build_search_url(keyword)
+    search_url = build_search_url(keyword, price_min=price_min, price_max=price_max)
 
     headers = {
         "User-Agent": os.getenv("BROWSER_USER_AGENT", DEFAULT_USER_AGENT),
@@ -466,7 +503,7 @@ def extract_products_from_ldjson(html: str, limit: int) -> List[Dict[str, str]]:
                 if isinstance(offers, dict):
                     price = str(offers.get("price", "") or "").strip()
 
-                if not url or url in seen or not re.search(r"/MLB-", url, re.IGNORECASE):
+                if not url or url in seen or not is_valid_product_url(url):
                     continue
 
                 products.append({"url": url, "title": name, "price_text": price})
@@ -487,8 +524,13 @@ def build_browser_context(browser):
     )
 
 
-def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
-    search_url = build_search_url(keyword)
+def scrape_top_product_links(
+    keyword: str,
+    limit: int,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+) -> List[Dict[str, str]]:
+    search_url = build_search_url(keyword, price_min=price_min, price_max=price_max)
     products: List[Dict[str, str]] = []
     seen_urls = set()
 
@@ -713,16 +755,23 @@ def scrape_product_detail(url: str, fallback_title: str) -> Optional[Product]:
         return Product(name=title, price=price_value, url=url)
 
 
-def scrape_mercadolivre(keyword: str, limit: int) -> List[Product]:
-    links = scrape_top_product_links(keyword, limit)
+def scrape_mercadolivre(
+    keyword: str,
+    limit: int,
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+) -> List[Product]:
+    links = scrape_top_product_links(keyword, limit, price_min=price_min, price_max=price_max)
 
     if not links:
         logger.warning("Sem links pela interface web. Usando fallback API.")
-        api_items = scrape_mercadolivre_api(keyword, limit)
+        api_items = scrape_mercadolivre_api(keyword, limit, price_min=price_min, price_max=price_max)
         if api_items:
             return sanitize_products(api_items)
         logger.warning("Fallback API sem resultados. Tentando fallback HTML requests.")
-        return sanitize_products(scrape_mercadolivre_http(keyword, limit))
+        return sanitize_products(
+            scrape_mercadolivre_http(keyword, limit, price_min=price_min, price_max=price_max)
+        )
 
     items: List[Product] = []
 
@@ -742,11 +791,13 @@ def scrape_mercadolivre(keyword: str, limit: int) -> List[Product]:
 
     if not items:
         logger.warning("Sem produtos válidos pelo Playwright. Usando fallback API.")
-        api_items = scrape_mercadolivre_api(keyword, limit)
+        api_items = scrape_mercadolivre_api(keyword, limit, price_min=price_min, price_max=price_max)
         if api_items:
             return sanitize_products(api_items)
         logger.warning("Fallback API sem resultados. Tentando fallback HTML requests.")
-        return sanitize_products(scrape_mercadolivre_http(keyword, limit))
+        return sanitize_products(
+            scrape_mercadolivre_http(keyword, limit, price_min=price_min, price_max=price_max)
+        )
 
     items = sanitize_products(items)
     logger.info("Produtos válidos extraídos (sanitizados): %d", len(items))
@@ -887,10 +938,10 @@ def send_telegram_message(token: str, chat_id: str, message: str) -> None:
         raise RuntimeError(f"Erro no Telegram: {response.status_code} - {response.text}")
 
 
-def process_products(config: AppConfig, products: List[Product], search_keyword: str) -> None:
+def open_spreadsheet(config: AppConfig):
     gc = get_gspread_client()
     try:
-        sh = gc.open_by_key(config.google_sheet_id)
+        return gc.open_by_key(config.google_sheet_id)
     except gspread.exceptions.SpreadsheetNotFound as exc:
         raise RuntimeError(
             "Planilha não encontrada ou sem permissão. Verifique GOOGLE_SHEET_ID e compartilhe a planilha com o e-mail da service account."
@@ -924,8 +975,8 @@ def process_products(config: AppConfig, products: List[Product], search_keyword:
         log_google_sheets_preflight(gc, config.google_sheet_id)
         raise
 
-    data_ws = sh.worksheet(config.data_sheet_name)
 
+def ensure_history_headers(data_ws) -> None:
     expected_headers = [
         "Data/Hora",
         "Termo Buscado",
@@ -935,27 +986,124 @@ def process_products(config: AppConfig, products: List[Product], search_keyword:
         "Variação (%)",
         "Link do Menor Preço Atual",
     ]
-
     current_headers = data_ws.row_values(1)
     if current_headers != expected_headers:
         data_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
 
+
+def ensure_target_headers(target_ws) -> None:
+    expected_headers = [
+        "Termo Buscado",
+        "Preco Minimo",
+        "Preco Maximo",
+        "Data Ultima Calibragem",
+    ]
+    current_headers = target_ws.row_values(1)
+    if current_headers != expected_headers:
+        target_ws.update("A1:D1", [expected_headers], value_input_option="USER_ENTERED")
+
+
+def get_or_create_worksheet(sh, worksheet_name: str, rows: int = 200, cols: int = 10):
+    try:
+        return sh.worksheet(worksheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        logger.warning("A aba '%s' não existe. Criando automaticamente.", worksheet_name)
+        return sh.add_worksheet(title=worksheet_name, rows=rows, cols=cols)
+
+
+def get_baseline_for_keyword(target_ws, search_keyword: str):
+    rows = target_ws.get_all_records()
+    keyword_key = search_keyword.strip().lower()
+
+    for idx, row in enumerate(rows, start=2):
+        term = str(row.get("Termo Buscado", "") or "").strip().lower()
+        if term == keyword_key:
+            return idx, row
+
+    return None, None
+
+
+def upsert_market_baseline(
+    target_ws,
+    search_keyword: str,
+    price_min: float,
+    price_max: float,
+    calibration_timestamp: str,
+) -> None:
+    row_index, _ = get_baseline_for_keyword(target_ws, search_keyword)
+    payload = [search_keyword, price_min, price_max, calibration_timestamp]
+
+    if row_index is None:
+        target_ws.append_row(payload, value_input_option="USER_ENTERED")
+        logger.info("Baseline inserido para termo: %s", search_keyword)
+        return
+
+    target_ws.update(
+        f"A{row_index}:D{row_index}",
+        [payload],
+        value_input_option="USER_ENTERED",
+    )
+    logger.info("Baseline atualizado para termo: %s", search_keyword)
+
+
+def calibrate_market_baseline(
+    config: AppConfig,
+    target_ws,
+    search_keyword: str,
+):
+    logger.info("Calibrando baseline para termo: %s", search_keyword)
+    products = scrape_mercadolivre(search_keyword, config.calibration_top_n)
     valid_products = filter_valid_products(
         products=products,
         search_keyword=search_keyword,
         min_price_threshold=config.min_price_threshold,
     )
+
     if not valid_products:
-        logger.warning("Nenhum produto válido após validações de qualidade.")
-        return
+        logger.warning("Calibragem sem produtos válidos para o termo: %s", search_keyword)
+        return None
 
     df = pd.DataFrame(
         [{"name": p.name, "price": p.price, "url": p.url} for p in valid_products]
     )
+    if df.empty:
+        logger.warning("Calibragem retornou DataFrame vazio para o termo: %s", search_keyword)
+        return None
+
+    median_price = float(df["price"].median())
+    baseline_min = median_price * 0.50
+    baseline_max = median_price * 1.10
+    timestamp = now_brt_str()
+
+    upsert_market_baseline(
+        target_ws=target_ws,
+        search_keyword=search_keyword,
+        price_min=baseline_min,
+        price_max=baseline_max,
+        calibration_timestamp=timestamp,
+    )
+
+    return {
+        "median": median_price,
+        "min": baseline_min,
+        "max": baseline_max,
+    }
+
+
+def process_products(config: AppConfig, data_ws, products: List[Product], search_keyword: str) -> bool:
+    ensure_history_headers(data_ws)
+
+    if not products:
+        logger.warning("Nenhum produto válido para processar no termo: %s", search_keyword)
+        return False
+
+    df = pd.DataFrame(
+        [{"name": p.name, "price": p.price, "url": p.url} for p in products]
+    )
 
     if df.empty:
         logger.warning("DataFrame vazio após processamento.")
-        return
+        return False
 
     min_idx = df["price"].idxmin()
     current_price = float(df.loc[min_idx, "price"])
@@ -1024,22 +1172,87 @@ def process_products(config: AppConfig, products: List[Product], search_keyword:
         else:
             logger.info("Telegram desabilitado. Mensagem gerada: %s", message)
 
+    return True
+
+
+def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) -> bool:
+    ensure_target_headers(target_ws)
+    ensure_history_headers(data_ws)
+
+    _, baseline_row = get_baseline_for_keyword(target_ws, search_keyword)
+    price_min = safe_float(baseline_row.get("Preco Minimo")) if baseline_row else None
+    price_max = safe_float(baseline_row.get("Preco Maximo")) if baseline_row else None
+
+    if price_min is None or price_max is None or price_max <= price_min:
+        logger.warning(
+            "Baseline ausente/inválido para '%s'. Iniciando calibragem.",
+            search_keyword,
+        )
+        baseline = calibrate_market_baseline(config, target_ws, search_keyword)
+        if not baseline:
+            return False
+        price_min = baseline["min"]
+        price_max = baseline["max"]
+
+    logger.info(
+        "Monitoramento '%s' com faixa de preço %.2f - %.2f.",
+        search_keyword,
+        price_min,
+        price_max,
+    )
+    products = scrape_mercadolivre(
+        search_keyword,
+        config.monitor_top_n,
+        price_min=price_min,
+        price_max=price_max,
+    )
+    valid_products = filter_valid_products(
+        products=products,
+        search_keyword=search_keyword,
+        min_price_threshold=config.min_price_threshold,
+    )
+
+    if not valid_products:
+        logger.warning(
+            "Busca monitorada sem resultados válidos para '%s'. Recalibrando automaticamente.",
+            search_keyword,
+        )
+        baseline = calibrate_market_baseline(config, target_ws, search_keyword)
+        if not baseline:
+            return False
+
+        products = scrape_mercadolivre(
+            search_keyword,
+            config.monitor_top_n,
+            price_min=baseline["min"],
+            price_max=baseline["max"],
+        )
+        valid_products = filter_valid_products(
+            products=products,
+            search_keyword=search_keyword,
+            min_price_threshold=config.min_price_threshold,
+        )
+
+        if not valid_products:
+            logger.warning("Mesmo após recalibragem, sem resultados válidos para '%s'.", search_keyword)
+            return False
+
+    return process_products(config, data_ws, valid_products, search_keyword)
+
 
 def main() -> int:
     try:
         config = load_config()
+        sh = open_spreadsheet(config)
+        data_ws = get_or_create_worksheet(sh, config.data_sheet_name)
+        target_ws = get_or_create_worksheet(sh, config.target_sheet_name)
+
         processed_any_term = False
 
         for keyword in config.search_keywords:
             logger.info("Iniciando busca para termo: %s", keyword)
-            products = scrape_mercadolivre(keyword, config.top_n)
-
-            if not products:
-                logger.warning("Nenhum produto foi extraído para o termo: %s", keyword)
-                continue
-
-            process_products(config, products, keyword)
-            processed_any_term = True
+            processed = daily_monitor(config, data_ws, target_ws, keyword)
+            processed_any_term = processed_any_term or processed
 
         if not processed_any_term:
             logger.warning("Nenhum termo retornou produtos válidos.")
