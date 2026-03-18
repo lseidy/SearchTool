@@ -35,7 +35,7 @@ jobs:
 
       - name: Run scraper
         env:
-          SEARCH_KEYWORDS: "Nintendo Switch 2|Bicicleta Aro 24|Jogo de Panelas Inox Tramontina"
+          SEARCH_KEYWORDS: "Nintendo Switch 2|Bicicleta Aro 24|Jogo de Panelas Inox Tramontina|Jogo de Panelas Tramontina Solar 4 peças|Jogo de Panelas Tramontina Solar 5 peças"
           TOP_N_RESULTS: "5"
           CALIBRATION_TOP_N: "50"
           MONITOR_TOP_N: "5"
