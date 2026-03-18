@@ -544,6 +544,7 @@ def scrape_top_product_links(
     limit: int,
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
+    validate_with_keyword: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     search_url = build_search_url(keyword, price_min=price_min, price_max=price_max)
     products: List[Dict[str, str]] = []
@@ -591,37 +592,37 @@ def scrape_top_product_links(
         if any(marker in lower_html for marker in bot_markers):
             logger.warning("Possível bloqueio anti-bot detectado na página de busca.")
 
-        ldjson_products = extract_products_from_ldjson(html, limit)
+        ldjson_products = extract_products_from_ldjson(html, 200)
         if ldjson_products:
-            logger.info("URLs coletadas via JSON-LD: %d", len(ldjson_products))
-            context.close()
-            browser.close()
-            return ldjson_products
+            for item in ldjson_products:
+                url = normalize_url(str(item.get("url", "") or ""))
+                if not url or url in seen_urls:
+                    continue
+                if url.startswith("/"):
+                    url = f"https://www.mercadolivre.com.br{url}"
+                if not is_valid_product_url(url):
+                    continue
 
-        poly_links = page.query_selector_all(
-            "a.poly-component__title, a.poly-card__title, a.ui-search-link, h3 a"
-        )
-        for link_el in poly_links:
-            url = normalize_url(link_el.get_attribute("href") or "")
-            if url.startswith("/"):
-                url = f"https://www.mercadolivre.com.br{url}"
-            if not url or url in seen_urls:
-                continue
-            if not is_valid_product_url(url):
-                continue
-            title = (link_el.inner_text() or "Produto").strip()
-            products.append({"url": url, "title": title, "price_text": None})
-            seen_urls.add(url)
-            if len(products) >= limit:
-                break
+                title = (str(item.get("title", "") or "").strip() or "Produto")
+                if validate_with_keyword and not validate_title_match(validate_with_keyword, title):
+                    continue
 
-        if products:
-            context.close()
-            browser.close()
-            logger.info("URLs coletadas (poly): %d", len(products))
-            return products
+                products.append(
+                    {
+                        "url": url,
+                        "title": title,
+                        "price_text": str(item.get("price_text", "") or "").strip() or None,
+                    }
+                )
+                seen_urls.add(url)
 
-        cards = page.query_selector_all("li.ui-search-layout__item")
+                if len(products) >= limit:
+                    context.close()
+                    browser.close()
+                    logger.info("URLs válidas coletadas via JSON-LD: %d", len(products))
+                    return products
+
+        cards = page.query_selector_all("li.ui-search-layout__item, div.poly-card")
 
         if not cards:
             logger.warning("Nenhum card encontrado com seletor principal. Tentando fallback por links.")
@@ -638,6 +639,9 @@ def scrape_top_product_links(
                     continue
 
                 title = (str(link.get("text", "") or "").strip() or "Produto")
+                if validate_with_keyword and not validate_title_match(validate_with_keyword, title):
+                    continue
+
                 products.append({"url": url, "title": title, "price_text": None})
                 seen_urls.add(url)
                 if len(products) >= limit:
@@ -649,7 +653,12 @@ def scrape_top_product_links(
             return products
 
         for card in cards:
-            link_el = card.query_selector("a.ui-search-link") or card.query_selector("a.poly-component__title")
+            link_el = (
+                card.query_selector("a.ui-search-link")
+                or card.query_selector("a.poly-component__title")
+                or card.query_selector("a.poly-card__title")
+                or card.query_selector("h3 a")
+            )
             title_el = card.query_selector("h3") or card.query_selector("a.poly-component__title")
             fraction_el = card.query_selector("span.andes-money-amount__fraction")
             cents_el = card.query_selector("span.andes-money-amount__cents")
@@ -667,6 +676,8 @@ def scrape_top_product_links(
                 continue
 
             title = (title_el.inner_text().strip() if title_el else "Produto")
+            if validate_with_keyword and not validate_title_match(validate_with_keyword, title):
+                continue
 
             price_text = None
             if fraction_el:
@@ -776,7 +787,13 @@ def scrape_mercadolivre(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
 ) -> List[Product]:
-    links = scrape_top_product_links(keyword, limit, price_min=price_min, price_max=price_max)
+    links = scrape_top_product_links(
+        keyword,
+        limit,
+        price_min=price_min,
+        price_max=price_max,
+        validate_with_keyword=keyword,
+    )
 
     if not links:
         logger.warning("Sem links pela interface web. Usando fallback API.")
