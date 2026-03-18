@@ -46,6 +46,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DATA_SHEET_NAME: "Historico"
           TARGET_SHEET_NAME: "PrecosAlvo"
+          ML_ITEM_CONDITION: "2230284"
+          ML_SHIPPING_ORIGIN: "10215068"
+          ML_NO_INDEX: "true"
           LOG_LEVEL: "INFO"
           PLAYWRIGHT_HEADLESS: "true"
           SCRAPER_PROXY_SERVER: ${{ secrets.SCRAPER_PROXY_SERVER }}

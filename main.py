@@ -201,17 +201,31 @@ def format_price_range_for_url(price_min: Optional[float], price_max: Optional[f
     return f"_PriceRange_{min_int}-{max_int}"
 
 
+def build_marketplace_filters_suffix() -> str:
+    item_condition = os.getenv("ML_ITEM_CONDITION", "").strip()
+    shipping_origin = os.getenv("ML_SHIPPING_ORIGIN", "").strip()
+    no_index_enabled = os.getenv("ML_NO_INDEX", "true").strip().lower() in {"1", "true", "yes"}
+
+    suffix_parts: List[str] = []
+    if item_condition:
+        suffix_parts.append(f"_ITEM*CONDITION_{item_condition}")
+    if no_index_enabled:
+        suffix_parts.append("_NoIndex_True")
+    if shipping_origin:
+        suffix_parts.append(f"_SHIPPING*ORIGIN_{shipping_origin}")
+
+    return "".join(suffix_parts)
+
+
 def build_search_url(
     keyword: str,
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
 ) -> str:
     price_range_part = format_price_range_for_url(price_min, price_max)
+    marketplace_filters = build_marketplace_filters_suffix()
     base = f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}_OrderId_PRICE"
-    if not price_range_part:
-        return base
-
-    return f"{base}{price_range_part}_NoIndex_True?sb=all_mercadolibre"
+    return f"{base}{price_range_part}{marketplace_filters}"
 
 
 def normalize_title_for_match(title: str) -> str:
