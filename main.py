@@ -207,7 +207,11 @@ def build_search_url(
     price_max: Optional[float] = None,
 ) -> str:
     price_range_part = format_price_range_for_url(price_min, price_max)
-    return f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}{price_range_part}_OrderId_PRICE"
+    base = f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}_OrderId_PRICE"
+    if not price_range_part:
+        return base
+
+    return f"{base}{price_range_part}_NoIndex_True?sb=all_mercadolibre"
 
 
 def normalize_title_for_match(title: str) -> str:
