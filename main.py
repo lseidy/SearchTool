@@ -207,7 +207,7 @@ def build_search_url(
     price_max: Optional[float] = None,
 ) -> str:
     price_range_part = format_price_range_for_url(price_min, price_max)
-    return f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}_OrderId_PRICE{price_range_part}"
+    return f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}{price_range_part}_OrderId_PRICE"
 
 
 def normalize_title_for_match(title: str) -> str:
@@ -284,6 +284,17 @@ def filter_valid_products(
         validated.append(product)
 
     return validated
+
+
+def filter_products_by_price_range(
+    products: List[Product],
+    price_min: Optional[float],
+    price_max: Optional[float],
+) -> List[Product]:
+    if price_min is None or price_max is None:
+        return products
+
+    return [product for product in products if price_min <= product.price <= price_max]
 
 
 def scrape_mercadolivre_api(
@@ -1211,6 +1222,7 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
         search_keyword=search_keyword,
         min_price_threshold=config.min_price_threshold,
     )
+    valid_products = filter_products_by_price_range(valid_products, price_min, price_max)
 
     if not valid_products:
         logger.warning(
@@ -1231,6 +1243,11 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
             products=products,
             search_keyword=search_keyword,
             min_price_threshold=config.min_price_threshold,
+        )
+        valid_products = filter_products_by_price_range(
+            valid_products,
+            baseline["min"],
+            baseline["max"],
         )
 
         if not valid_products:
