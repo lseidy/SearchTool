@@ -373,7 +373,7 @@ def scrape_mercadolivre_http(keyword: str, limit: int) -> List[Product]:
             break
 
     # fallback genérico por links contendo MLB
-        for match in re.finditer(r'href=["\']([^"\']*?/(?:MLB-|p/MLB)[^"\']+)["\']', html, flags=re.IGNORECASE):
+    for match in re.finditer(r'href=["\']([^"\']*?/(?:MLB-|p/MLB)[^"\']+)["\']', html, flags=re.IGNORECASE):
         url = normalize_url(match.group(1))
         if not url:
             continue
@@ -560,7 +560,7 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
                 url = f"https://www.mercadolivre.com.br{url}"
             if not url or url in seen_urls:
                 continue
-                if not is_valid_product_url(url):
+            if not is_valid_product_url(url):
                 continue
             title = (link_el.inner_text() or "Produto").strip()
             products.append({"url": url, "title": title, "price_text": None})
@@ -587,7 +587,7 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
                 url = normalize_url(str(link.get("href", "") or ""))
                 if not url or url in seen_urls:
                     continue
-                    if not is_valid_product_url(url):
+                if not is_valid_product_url(url):
                     continue
 
                 title = (str(link.get("text", "") or "").strip() or "Produto")
@@ -616,7 +616,7 @@ def scrape_top_product_links(keyword: str, limit: int) -> List[Dict[str, str]]:
             if not url or url in seen_urls:
                 continue
 
-                if not is_valid_product_url(url):
+            if not is_valid_product_url(url):
                 continue
 
             title = (title_el.inner_text().strip() if title_el else "Produto")
