@@ -28,6 +28,7 @@ jobs:
         env:
           SEARCH_KEYWORDS: "Nintendo Switch 2|Bicicleta Aro 24|Jogo de Panelas Inox Tramontina"
           TOP_N_RESULTS: "10"
+          MIN_PRICE_THRESHOLD: "0"
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}

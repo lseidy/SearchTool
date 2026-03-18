@@ -40,19 +40,6 @@ TITLE_BLACKLIST_EXACT = {
     "mercado livre",
 }
 
-SEARCH_STOPWORDS = {
-    "de",
-    "do",
-    "da",
-    "dos",
-    "das",
-    "e",
-    "com",
-    "para",
-    "a",
-    "o",
-}
-
 
 def get_proxy_settings() -> Optional[Dict[str, str]]:
     server = os.getenv("SCRAPER_PROXY_SERVER", "").strip()
@@ -105,6 +92,7 @@ class AppConfig:
     search_keyword: str
     search_keywords: List[str]
     top_n: int
+    min_price_threshold: float
     google_sheet_id: str
     data_sheet_name: str
     target_sheet_name: str
@@ -134,6 +122,7 @@ def load_config() -> AppConfig:
     search_keywords = parse_search_keywords()
     search_keyword = search_keywords[0]
     top_n = int(os.getenv("TOP_N_RESULTS", "5"))
+    min_price_threshold = float(os.getenv("MIN_PRICE_THRESHOLD", "0"))
 
     google_sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
     telegram_token = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -148,6 +137,7 @@ def load_config() -> AppConfig:
         search_keyword=search_keyword,
         search_keywords=search_keywords,
         top_n=top_n,
+        min_price_threshold=min_price_threshold,
         google_sheet_id=google_sheet_id,
         data_sheet_name=os.getenv("DATA_SHEET_NAME", "Historico").strip(),
         target_sheet_name=os.getenv("TARGET_SHEET_NAME", "PrecosAlvo").strip(),
@@ -244,35 +234,35 @@ def normalize_text(text: str) -> str:
     return normalized
 
 
-def tokenize_search_term(search_keyword: str) -> List[str]:
-    tokens = normalize_text(search_keyword).split()
-    return [t for t in tokens if t not in SEARCH_STOPWORDS and len(t) >= 2]
+def keyword_tokens(keyword: str) -> List[str]:
+    return [token for token in normalize_text(keyword).split() if token]
 
 
-def relevance_score(title: str, keyword_tokens: List[str]) -> int:
-    title_tokens = set(normalize_text(title).split())
-    return sum(1 for token in keyword_tokens if token in title_tokens)
+def validate_title_match(keyword: str, title: str) -> bool:
+    required_tokens = keyword_tokens(keyword)
+    if not required_tokens:
+        return True
+
+    title_tokens = set(keyword_tokens(title))
+    return all(token in title_tokens for token in required_tokens)
 
 
-def filter_relevant_products(products: List[Product], search_keyword: str) -> List[Product]:
-    keyword_tokens = tokenize_search_term(search_keyword)
-    if not keyword_tokens:
-        return products
+def filter_valid_products(
+    products: List[Product],
+    search_keyword: str,
+    min_price_threshold: float,
+) -> List[Product]:
+    base = sanitize_products(products)
+    validated: List[Product] = []
 
-    scored = [
-        (product, relevance_score(product.name, keyword_tokens))
-        for product in products
-    ]
+    for product in base:
+        if product.price < min_price_threshold:
+            continue
+        if not validate_title_match(search_keyword, product.name):
+            continue
+        validated.append(product)
 
-    high_relevance = [product for product, score in scored if score >= 2]
-    if high_relevance:
-        return high_relevance
-
-    medium_relevance = [product for product, score in scored if score >= 1]
-    if medium_relevance:
-        return medium_relevance
-
-    return products
+    return validated
 
 
 def scrape_mercadolivre_api(keyword: str, limit: int) -> List[Product]:
@@ -950,10 +940,13 @@ def process_products(config: AppConfig, products: List[Product], search_keyword:
     if current_headers != expected_headers:
         data_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
 
-    valid_products = sanitize_products(products)
-    valid_products = filter_relevant_products(valid_products, search_keyword)
+    valid_products = filter_valid_products(
+        products=products,
+        search_keyword=search_keyword,
+        min_price_threshold=config.min_price_threshold,
+    )
     if not valid_products:
-        logger.warning("Nenhum produto válido após sanitização.")
+        logger.warning("Nenhum produto válido após validações de qualidade.")
         return
 
     df = pd.DataFrame(
@@ -966,7 +959,7 @@ def process_products(config: AppConfig, products: List[Product], search_keyword:
 
     min_idx = df["price"].idxmin()
     current_price = float(df.loc[min_idx, "price"])
-    average_price = float(df["price"].mean())
+    median_price = float(df["price"].median())
     current_link = str(df.loc[min_idx, "url"])
     timestamp = now_brt_str()
 
@@ -999,7 +992,7 @@ def process_products(config: AppConfig, products: List[Product], search_keyword:
         timestamp,
         search_keyword,
         current_price,
-        average_price,
+        median_price,
         historical_min,
         variation_pct,
         current_link,
