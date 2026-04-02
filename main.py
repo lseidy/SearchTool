@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus
-
 import gspread
 import pandas as pd
 import requests
@@ -39,6 +38,38 @@ TITLE_BLACKLIST_EXACT = {
     "ofertas",
     "mercado livre",
 }
+
+BLACKLIST_WORDS = [
+    "capa",
+    "case",
+    "pelicula",
+    "película",
+    "adesivo",
+    "skin",
+    "suporte",
+    "cabo",
+    "carregador",
+    "fone",
+    "carcaca",
+    "carcaça",
+    "peca",
+    "peça",
+    "reparo",
+    "conserto",
+    "manutencao",
+    "manutenção",
+    "alca",
+    "alça",
+    "bag",
+    "bolsa",
+]
+
+PREPOSITION_GUARD_TERMS = [
+    "para",
+    "de",
+    "compatível com",
+    "compativel com",
+]
 
 
 def get_proxy_settings() -> Optional[Dict[str, str]]:
@@ -277,7 +308,39 @@ def keyword_tokens(keyword: str) -> List[str]:
     return [token for token in normalize_text(keyword).split() if token]
 
 
+def contains_blacklist_word(title: str) -> bool:
+    normalized_title = normalize_text(title)
+    if not normalized_title:
+        return False
+
+    title_tokens = set(normalized_title.split())
+    return any(normalize_text(word) in title_tokens for word in BLACKLIST_WORDS)
+
+
+def has_suspicious_preposition_before_keyword(keyword: str, title: str) -> bool:
+    normalized_title = normalize_text(title)
+    keyword_parts = keyword_tokens(keyword)
+    if not normalized_title or not keyword_parts:
+        return False
+
+    anchor = keyword_parts[0]
+    anchor_match = re.search(rf"\b{re.escape(anchor)}\b", normalized_title)
+    if not anchor_match:
+        return False
+
+    prefix = normalized_title[:anchor_match.start()].strip()
+    if not prefix:
+        return False
+
+    return any(re.search(rf"\b{re.escape(term)}\b", prefix) for term in PREPOSITION_GUARD_TERMS)
+
+
 def validate_title_match(keyword: str, title: str) -> bool:
+    if contains_blacklist_word(title):
+        return False
+    if has_suspicious_preposition_before_keyword(keyword, title):
+        return False
+
     required_tokens = keyword_tokens(keyword)
     if not required_tokens:
         return True
@@ -1108,6 +1171,20 @@ def calibrate_market_baseline(
     if not valid_products:
         logger.warning("Calibragem sem produtos válidos para o termo: %s", search_keyword)
         return None
+
+    max_price = max(product.price for product in valid_products)
+    relative_floor = max_price * 0.50
+    robust_products = [
+        product for product in valid_products if product.price >= relative_floor
+    ]
+
+    if robust_products:
+        valid_products = robust_products
+    else:
+        logger.warning(
+            "Filtro de robustez removeu todos os itens de calibragem para '%s'. Mantendo lista validada original.",
+            search_keyword,
+        )
 
     df = pd.DataFrame(
         [{"name": p.name, "price": p.price, "url": p.url} for p in valid_products]
