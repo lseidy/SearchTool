@@ -5,7 +5,7 @@ import re
 import sys
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus
 import gspread
@@ -252,10 +252,12 @@ def build_search_url(
     keyword: str,
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
+    sort_by_price: bool = True,
 ) -> str:
     price_range_part = format_price_range_for_url(price_min, price_max)
     marketplace_filters = build_marketplace_filters_suffix()
-    base = f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}_OrderId_PRICE"
+    sort_part = "_OrderId_PRICE" if sort_by_price else ""
+    base = f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}{sort_part}"
     return f"{base}{price_range_part}{marketplace_filters}"
 
 
@@ -383,6 +385,7 @@ def scrape_mercadolivre_api(
     limit: int,
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
+    sort_by_price: bool = True,
 ) -> List[Product]:
     endpoint = "https://api.mercadolibre.com/sites/MLB/search"
     logger.info("Tentando fallback pela API pública do Mercado Livre.")
@@ -390,7 +393,9 @@ def scrape_mercadolivre_api(
     session = get_requests_session()
 
     try:
-        params = {"q": keyword, "limit": limit, "sort": "price_asc"}
+        params = {"q": keyword, "limit": limit}
+        if sort_by_price:
+            params["sort"] = "price_asc"
         if price_min is not None and price_max is not None:
             min_int = max(0, int(round(price_min)))
             max_int = max(min_int, int(round(price_max)))
@@ -447,9 +452,15 @@ def scrape_mercadolivre_http(
     limit: int,
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
+    sort_by_price: bool = True,
 ) -> List[Product]:
     logger.info("Tentando fallback por HTML via requests.")
-    search_url = build_search_url(keyword, price_min=price_min, price_max=price_max)
+    search_url = build_search_url(
+        keyword,
+        price_min=price_min,
+        price_max=price_max,
+        sort_by_price=sort_by_price,
+    )
 
     headers = {
         "User-Agent": os.getenv("BROWSER_USER_AGENT", DEFAULT_USER_AGENT),
@@ -622,8 +633,14 @@ def scrape_top_product_links(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
     validate_with_keyword: Optional[str] = None,
+    sort_by_price: bool = True,
 ) -> List[Dict[str, str]]:
-    search_url = build_search_url(keyword, price_min=price_min, price_max=price_max)
+    search_url = build_search_url(
+        keyword,
+        price_min=price_min,
+        price_max=price_max,
+        sort_by_price=sort_by_price,
+    )
     products: List[Dict[str, str]] = []
     seen_urls = set()
 
@@ -863,6 +880,7 @@ def scrape_mercadolivre(
     limit: int,
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
+    sort_by_price: bool = True,
 ) -> List[Product]:
     links = scrape_top_product_links(
         keyword,
@@ -870,16 +888,29 @@ def scrape_mercadolivre(
         price_min=price_min,
         price_max=price_max,
         validate_with_keyword=keyword,
+        sort_by_price=sort_by_price,
     )
 
     if not links:
         logger.warning("Sem links pela interface web. Usando fallback API.")
-        api_items = scrape_mercadolivre_api(keyword, limit, price_min=price_min, price_max=price_max)
+        api_items = scrape_mercadolivre_api(
+            keyword,
+            limit,
+            price_min=price_min,
+            price_max=price_max,
+            sort_by_price=sort_by_price,
+        )
         if api_items:
             return sanitize_products(api_items)
         logger.warning("Fallback API sem resultados. Tentando fallback HTML requests.")
         return sanitize_products(
-            scrape_mercadolivre_http(keyword, limit, price_min=price_min, price_max=price_max)
+            scrape_mercadolivre_http(
+                keyword,
+                limit,
+                price_min=price_min,
+                price_max=price_max,
+                sort_by_price=sort_by_price,
+            )
         )
 
     items: List[Product] = []
@@ -900,12 +931,24 @@ def scrape_mercadolivre(
 
     if not items:
         logger.warning("Sem produtos válidos pelo Playwright. Usando fallback API.")
-        api_items = scrape_mercadolivre_api(keyword, limit, price_min=price_min, price_max=price_max)
+        api_items = scrape_mercadolivre_api(
+            keyword,
+            limit,
+            price_min=price_min,
+            price_max=price_max,
+            sort_by_price=sort_by_price,
+        )
         if api_items:
             return sanitize_products(api_items)
         logger.warning("Fallback API sem resultados. Tentando fallback HTML requests.")
         return sanitize_products(
-            scrape_mercadolivre_http(keyword, limit, price_min=price_min, price_max=price_max)
+            scrape_mercadolivre_http(
+                keyword,
+                limit,
+                price_min=price_min,
+                price_max=price_max,
+                sort_by_price=sort_by_price,
+            )
         )
 
     items = sanitize_products(items)
@@ -1132,6 +1175,19 @@ def get_baseline_for_keyword(target_ws, search_keyword: str):
     return None, None
 
 
+def parse_calibration_date(value: str) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def upsert_market_baseline(
     target_ws,
     search_keyword: str,
@@ -1161,7 +1217,11 @@ def calibrate_market_baseline(
     search_keyword: str,
 ):
     logger.info("Calibrando baseline para termo: %s", search_keyword)
-    products = scrape_mercadolivre(search_keyword, config.calibration_top_n)
+    products = scrape_mercadolivre(
+        search_keyword,
+        config.calibration_top_n,
+        sort_by_price=False,
+    )
     valid_products = filter_valid_products(
         products=products,
         search_keyword=search_keyword,
@@ -1305,6 +1365,23 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
     _, baseline_row = get_baseline_for_keyword(target_ws, search_keyword)
     price_min = safe_float(baseline_row.get("Preco Minimo")) if baseline_row else None
     price_max = safe_float(baseline_row.get("Preco Maximo")) if baseline_row else None
+    last_calibration_raw = baseline_row.get("Data Ultima Calibragem") if baseline_row else ""
+    last_calibration_at = parse_calibration_date(str(last_calibration_raw or ""))
+
+    baseline_expired = True
+    if last_calibration_at is not None:
+        baseline_expired = (datetime.now() - last_calibration_at) > timedelta(days=30)
+
+    if baseline_row and baseline_expired:
+        logger.info(
+            "Calibragem de '%s' com mais de 30 dias. Recalibrando por relevância.",
+            search_keyword,
+        )
+        baseline = calibrate_market_baseline(config, target_ws, search_keyword)
+        if not baseline:
+            return False
+        price_min = baseline["min"]
+        price_max = baseline["max"]
 
     if price_min is None or price_max is None or price_max <= price_min:
         logger.warning(
@@ -1328,6 +1405,7 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
         config.monitor_top_n,
         price_min=price_min,
         price_max=price_max,
+        sort_by_price=True,
     )
     valid_products = filter_valid_products(
         products=products,
@@ -1350,6 +1428,7 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
             config.monitor_top_n,
             price_min=baseline["min"],
             price_max=baseline["max"],
+            sort_by_price=True,
         )
         valid_products = filter_valid_products(
             products=products,
