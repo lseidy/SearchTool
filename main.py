@@ -253,11 +253,13 @@ def build_search_url(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
     sort_by_price: bool = True,
+    start_offset: int = 1,
 ) -> str:
     price_range_part = format_price_range_for_url(price_min, price_max)
     marketplace_filters = build_marketplace_filters_suffix()
     sort_part = "_OrderId_PRICE" if sort_by_price else ""
-    base = f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}{sort_part}"
+    offset_part = f"_Desde_{start_offset}" if start_offset > 1 else ""
+    base = f"https://lista.mercadolivre.com.br/{quote_plus(keyword)}{offset_part}{sort_part}"
     return f"{base}{price_range_part}{marketplace_filters}"
 
 
@@ -453,6 +455,7 @@ def scrape_mercadolivre_http(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
     sort_by_price: bool = True,
+    start_offset: int = 1,
 ) -> List[Product]:
     logger.info("Tentando fallback por HTML via requests.")
     search_url = build_search_url(
@@ -460,6 +463,7 @@ def scrape_mercadolivre_http(
         price_min=price_min,
         price_max=price_max,
         sort_by_price=sort_by_price,
+        start_offset=start_offset,
     )
 
     headers = {
@@ -634,12 +638,14 @@ def scrape_top_product_links(
     price_max: Optional[float] = None,
     validate_with_keyword: Optional[str] = None,
     sort_by_price: bool = True,
+    start_offset: int = 1,
 ) -> List[Dict[str, str]]:
     search_url = build_search_url(
         keyword,
         price_min=price_min,
         price_max=price_max,
         sort_by_price=sort_by_price,
+        start_offset=start_offset,
     )
     products: List[Dict[str, str]] = []
     seen_urls = set()
@@ -881,6 +887,7 @@ def scrape_mercadolivre(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
     sort_by_price: bool = True,
+    start_offset: int = 1,
 ) -> List[Product]:
     links = scrape_top_product_links(
         keyword,
@@ -889,6 +896,7 @@ def scrape_mercadolivre(
         price_max=price_max,
         validate_with_keyword=keyword,
         sort_by_price=sort_by_price,
+        start_offset=start_offset,
     )
 
     if not links:
@@ -910,6 +918,7 @@ def scrape_mercadolivre(
                 price_min=price_min,
                 price_max=price_max,
                 sort_by_price=sort_by_price,
+                start_offset=start_offset,
             )
         )
 
@@ -948,6 +957,7 @@ def scrape_mercadolivre(
                 price_min=price_min,
                 price_max=price_max,
                 sort_by_price=sort_by_price,
+                start_offset=start_offset,
             )
         )
 
@@ -1358,6 +1368,55 @@ def process_products(config: AppConfig, data_ws, products: List[Product], search
     return True
 
 
+def collect_monitor_products_with_quota(
+    config: AppConfig,
+    search_keyword: str,
+    price_min: float,
+    price_max: float,
+    quota: int,
+    max_pages: int = 3,
+) -> List[Product]:
+    collected: List[Product] = []
+    seen_urls = set()
+
+    for page_number in range(1, max_pages + 1):
+        start_offset = 1 + (page_number - 1) * 48
+        logger.info(
+            "Monitoramento '%s' | página %d/%d | offset=%d",
+            search_keyword,
+            page_number,
+            max_pages,
+            start_offset,
+        )
+
+        page_products = scrape_mercadolivre(
+            search_keyword,
+            quota,
+            price_min=price_min,
+            price_max=price_max,
+            sort_by_price=True,
+            start_offset=start_offset,
+        )
+        page_valid = filter_valid_products(
+            products=page_products,
+            search_keyword=search_keyword,
+            min_price_threshold=config.min_price_threshold,
+        )
+        page_valid = filter_products_by_price_range(page_valid, price_min, price_max)
+
+        for product in page_valid:
+            norm_url = normalize_url(product.url)
+            if not norm_url or norm_url in seen_urls:
+                continue
+            seen_urls.add(norm_url)
+            collected.append(product)
+
+            if len(collected) >= quota:
+                return collected
+
+    return collected
+
+
 def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) -> bool:
     ensure_target_headers(target_ws)
     ensure_history_headers(data_ws)
@@ -1400,50 +1459,35 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
         price_min,
         price_max,
     )
-    products = scrape_mercadolivre(
-        search_keyword,
-        config.monitor_top_n,
+    valid_products = collect_monitor_products_with_quota(
+        config=config,
+        search_keyword=search_keyword,
         price_min=price_min,
         price_max=price_max,
-        sort_by_price=True,
+        quota=config.monitor_top_n,
+        max_pages=3,
     )
-    valid_products = filter_valid_products(
-        products=products,
-        search_keyword=search_keyword,
-        min_price_threshold=config.min_price_threshold,
-    )
-    valid_products = filter_products_by_price_range(valid_products, price_min, price_max)
 
     if not valid_products:
         logger.warning(
-            "Busca monitorada sem resultados válidos para '%s'. Recalibrando automaticamente.",
+            "Busca monitorada sem resultados válidos após 3 páginas para '%s'. Recalibrando automaticamente.",
             search_keyword,
         )
         baseline = calibrate_market_baseline(config, target_ws, search_keyword)
         if not baseline:
             return False
-
-        products = scrape_mercadolivre(
-            search_keyword,
-            config.monitor_top_n,
+        valid_products = collect_monitor_products_with_quota(
+            config=config,
+            search_keyword=search_keyword,
             price_min=baseline["min"],
             price_max=baseline["max"],
-            sort_by_price=True,
-        )
-        valid_products = filter_valid_products(
-            products=products,
-            search_keyword=search_keyword,
-            min_price_threshold=config.min_price_threshold,
-        )
-        valid_products = filter_products_by_price_range(
-            valid_products,
-            baseline["min"],
-            baseline["max"],
+            quota=config.monitor_top_n,
+            max_pages=3,
         )
 
-        if not valid_products:
-            logger.warning("Mesmo após recalibragem, sem resultados válidos para '%s'.", search_keyword)
-            return False
+    if not valid_products:
+        logger.warning("Mesmo após recalibragem, sem resultados válidos para '%s'.", search_keyword)
+        return False
 
     return process_products(config, data_ws, valid_products, search_keyword)
 
