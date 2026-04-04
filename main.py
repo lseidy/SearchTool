@@ -803,7 +803,13 @@ def scrape_product_detail(url: str, fallback_title: str) -> Optional[Product]:
         headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
         launch_args = {
             "headless": headless,
-            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            "args": [
+                "--disable-blink-features=AutomationControlled", 
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu"
+            ],
         }
         proxy_settings = get_proxy_settings()
         if proxy_settings:
