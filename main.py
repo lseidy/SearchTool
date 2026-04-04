@@ -6,7 +6,7 @@ import sys
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 import gspread
 import pandas as pd
@@ -25,6 +25,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("buscador-precos")
+
+DEFAULT_MARKETPLACE = "mercadolivre"
 
 
 DEFAULT_USER_AGENT = (
@@ -131,6 +133,251 @@ class AppConfig:
     telegram_token: str
     telegram_chat_id: str
     telegram_enabled: bool
+
+
+class MultiMarketplaceScraper:
+    SITE_CONFIG: Dict[str, Dict[str, Any]] = {
+        "mercadolivre": {
+            "base_url": "https://lista.mercadolivre.com.br/{query}",
+            "sort_lowest": "_OrderId_PRICE",
+            "range_mode": "path_reais",
+            "selectors": {
+                "cards": "li.ui-search-layout__item, div.poly-card",
+                "title": "h3, a.poly-component__title, a.poly-card__title, a.ui-search-link",
+                "price_whole": "span.andes-money-amount__fraction",
+                "price_fraction": "span.andes-money-amount__cents",
+                "link": "a.ui-search-link, a.poly-component__title, a.poly-card__title, h3 a",
+            },
+        },
+        "amazon": {
+            "base_url": "https://www.amazon.com.br/s?k={query}",
+            "sort_lowest": "s=price-asc-rank",
+            "range_mode": "query_cents",
+            "range_param": "rh=p_36:{min}-{max}",
+            "selectors": {
+                "cards": "div.s-result-item[data-component-type='s-search-result']",
+                "title": "h2 span",
+                "price_whole": "span.a-price-whole",
+                "price_fraction": "span.a-price-fraction",
+                "link": "h2 a.a-link-normal",
+            },
+        },
+        "shopee": {
+            "base_url": "https://shopee.com.br/search?keyword={query}",
+            "sort_lowest": "sortBy=price&order=asc",
+            "range_mode": "query_shopee_filter",
+            "selectors": {
+                "cards": "div.shopee-search-item-result__item, div[data-sqe='item']",
+                "title": "div[data-sqe='name'], div.line-clamp-2",
+                "price_whole": "span:has-text('R$'), div:has-text('R$')",
+                "price_fraction": "",
+                "link": "a[data-sqe='link'], a.contents",
+            },
+        },
+        "magalu": {
+            "base_url": "https://www.magazineluiza.com.br/busca/{query}/",
+            "sort_lowest": "sortOrientation=asc&sortType=price",
+            "range_mode": "query_magalu_filter",
+            "selectors": {
+                "cards": "li[data-testid='product-card'], div[data-testid='product-card-container']",
+                "title": "h2[data-testid='product-title'], h2",
+                "price_whole": "p[data-testid='price-value'], span[data-testid='price-value']",
+                "price_fraction": "",
+                "link": "a[data-testid='product-card-container'], a",
+            },
+        },
+    }
+
+    def __init__(self, browser_context_builder):
+        self.browser_context_builder = browser_context_builder
+
+    def normalize_marketplace(self, marketplace: Optional[str]) -> str:
+        key = (marketplace or DEFAULT_MARKETPLACE).strip().lower()
+        if key not in self.SITE_CONFIG:
+            return DEFAULT_MARKETPLACE
+        return key
+
+    def build_search_url(
+        self,
+        marketplace: str,
+        keyword: str,
+        price_min: Optional[float] = None,
+        price_max: Optional[float] = None,
+        sort_by_price: bool = True,
+        start_offset: int = 1,
+    ) -> str:
+        site_key = self.normalize_marketplace(marketplace)
+        site = self.SITE_CONFIG[site_key]
+        query = quote_plus(keyword)
+        url = site["base_url"].format(query=query)
+
+        if site_key == "mercadolivre":
+            offset_part = f"_Desde_{start_offset}" if start_offset > 1 else ""
+            sort_part = site["sort_lowest"] if sort_by_price else ""
+            range_part = ""
+            if price_min is not None and price_max is not None:
+                min_int = max(0, int(round(price_min)))
+                max_int = max(min_int, int(round(price_max)))
+                range_part = f"_PriceRange_{min_int}-{max_int}"
+            return f"{url}{offset_part}{sort_part}{range_part}{build_marketplace_filters_suffix()}"
+
+        query_params: List[str] = []
+        if sort_by_price and site.get("sort_lowest"):
+            query_params.append(site["sort_lowest"])
+
+        if price_min is not None and price_max is not None:
+            min_value = max(0, int(round(price_min)))
+            max_value = max(min_value, int(round(price_max)))
+
+            if site.get("range_mode") == "query_cents":
+                min_value *= 100
+                max_value *= 100
+                range_param = site.get("range_param", "").format(min=min_value, max=max_value)
+                if range_param:
+                    query_params.append(range_param)
+
+            elif site.get("range_mode") == "query_shopee_filter":
+                # Ex.: fe_filter_options=[{"group_name":"PRICE_RANGE","values":["30▶◀150"]}]
+                filter_payload = [
+                    {
+                        "group_name": "PRICE_RANGE",
+                        "values": [f"{min_value}▶◀{max_value}"],
+                    }
+                ]
+                query_params.append(f"fe_filter_options={quote_plus(json.dumps(filter_payload, ensure_ascii=False))}")
+
+            elif site.get("range_mode") == "query_magalu_filter":
+                # Magalu geralmente usa filtro em centavos: filters=price---5000:2092500
+                min_cents = min_value * 100
+                max_cents = max_value * 100
+                query_params.append(f"filters=price---{min_cents}:{max_cents}")
+
+        if not query_params:
+            return url
+
+        joiner = "&" if "?" in url else "?"
+        return f"{url}{joiner}{'&'.join(query_params)}"
+
+    def extract_price_from_card(self, card, selectors: Dict[str, str]) -> Optional[float]:
+        whole_selector = selectors.get("price_whole", "")
+        fraction_selector = selectors.get("price_fraction", "")
+
+        whole_text = ""
+        fraction_text = ""
+
+        if whole_selector:
+            whole_el = card.query_selector(whole_selector)
+            if whole_el:
+                whole_text = (whole_el.inner_text() or "").strip()
+
+        if fraction_selector:
+            fraction_el = card.query_selector(fraction_selector)
+            if fraction_el:
+                fraction_text = (fraction_el.inner_text() or "").strip()
+
+        if whole_text:
+            if fraction_text:
+                return parse_price_to_float(f"{whole_text},{fraction_text}")
+            return parse_price_to_float(whole_text)
+
+        return None
+
+    def get_products(
+        self,
+        marketplace: str,
+        keyword: str,
+        limit: int,
+        price_min: Optional[float] = None,
+        price_max: Optional[float] = None,
+        sort_by_price: bool = True,
+        start_offset: int = 1,
+    ) -> List[Product]:
+        site_key = self.normalize_marketplace(marketplace)
+        if site_key == "mercadolivre":
+            return scrape_mercadolivre(
+                keyword=keyword,
+                limit=limit,
+                price_min=price_min,
+                price_max=price_max,
+                sort_by_price=sort_by_price,
+                start_offset=start_offset,
+            )
+
+        site = self.SITE_CONFIG[site_key]
+        selectors = site["selectors"]
+        search_url = self.build_search_url(
+            marketplace=site_key,
+            keyword=keyword,
+            price_min=price_min,
+            price_max=price_max,
+            sort_by_price=sort_by_price,
+            start_offset=start_offset,
+        )
+
+        products: List[Product] = []
+        seen = set()
+        logger.info("Abrindo busca %s: %s", site_key, search_url)
+
+        with sync_playwright() as p:
+            headless = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() != "false"
+            launch_args = {
+                "headless": headless,
+                "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            }
+            proxy_settings = get_proxy_settings()
+            if proxy_settings:
+                launch_args["proxy"] = proxy_settings
+
+            browser = p.chromium.launch(**launch_args)
+            context = self.browser_context_builder(browser)
+            page = context.new_page()
+
+            try:
+                page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2500)
+            except PlaywrightTimeoutError:
+                logger.warning("Timeout ao abrir busca %s para '%s'.", site_key, keyword)
+                context.close()
+                browser.close()
+                return []
+
+            cards = page.query_selector_all(selectors.get("cards", ""))
+            for card in cards:
+                link_el = card.query_selector(selectors.get("link", ""))
+                title_el = card.query_selector(selectors.get("title", ""))
+
+                if not link_el or not title_el:
+                    continue
+
+                raw_url = (link_el.get_attribute("href") or "").strip()
+                if raw_url.startswith("/"):
+                    # Dominio base por marketplace
+                    base_domain = {
+                        "amazon": "https://www.amazon.com.br",
+                        "shopee": "https://shopee.com.br",
+                        "magalu": "https://www.magazineluiza.com.br",
+                    }.get(site_key, "")
+                    raw_url = f"{base_domain}{raw_url}" if base_domain else raw_url
+
+                url = normalize_url(raw_url)
+                title = (title_el.inner_text() or "").strip()
+
+                if not url or not title or url in seen:
+                    continue
+
+                price = self.extract_price_from_card(card, selectors)
+                if price is None:
+                    continue
+
+                seen.add(url)
+                products.append(Product(name=title, price=price, url=url))
+                if len(products) >= limit:
+                    break
+
+            context.close()
+            browser.close()
+
+        return sanitize_products(products)
 
 
 def parse_search_keywords() -> List[str]:
@@ -1161,13 +1408,14 @@ def ensure_history_headers(data_ws) -> None:
 def ensure_target_headers(target_ws) -> None:
     expected_headers = [
         "Termo Buscado",
+        "Marketplace",
         "Preco Minimo",
         "Preco Maximo",
         "Data Ultima Calibragem",
     ]
     current_headers = target_ws.row_values(1)
     if current_headers != expected_headers:
-        target_ws.update("A1:D1", [expected_headers], value_input_option="USER_ENTERED")
+        target_ws.update("A1:E1", [expected_headers], value_input_option="USER_ENTERED")
 
 
 def get_or_create_worksheet(sh, worksheet_name: str, rows: int = 200, cols: int = 10):
@@ -1178,13 +1426,15 @@ def get_or_create_worksheet(sh, worksheet_name: str, rows: int = 200, cols: int 
         return sh.add_worksheet(title=worksheet_name, rows=rows, cols=cols)
 
 
-def get_baseline_for_keyword(target_ws, search_keyword: str):
+def get_baseline_for_keyword(target_ws, search_keyword: str, marketplace: str):
     rows = target_ws.get_all_records()
     keyword_key = search_keyword.strip().lower()
+    marketplace_key = (marketplace or DEFAULT_MARKETPLACE).strip().lower()
 
     for idx, row in enumerate(rows, start=2):
         term = str(row.get("Termo Buscado", "") or "").strip().lower()
-        if term == keyword_key:
+        row_marketplace = str(row.get("Marketplace", "") or "").strip().lower() or DEFAULT_MARKETPLACE
+        if term == keyword_key and row_marketplace == marketplace_key:
             return idx, row
 
     return None, None
@@ -1206,12 +1456,13 @@ def parse_calibration_date(value: str) -> Optional[datetime]:
 def upsert_market_baseline(
     target_ws,
     search_keyword: str,
+    marketplace: str,
     price_min: float,
     price_max: float,
     calibration_timestamp: str,
 ) -> None:
-    row_index, _ = get_baseline_for_keyword(target_ws, search_keyword)
-    payload = [search_keyword, price_min, price_max, calibration_timestamp]
+    row_index, _ = get_baseline_for_keyword(target_ws, search_keyword, marketplace)
+    payload = [search_keyword, marketplace, price_min, price_max, calibration_timestamp]
 
     if row_index is None:
         target_ws.append_row(payload, value_input_option="USER_ENTERED")
@@ -1219,22 +1470,25 @@ def upsert_market_baseline(
         return
 
     target_ws.update(
-        f"A{row_index}:D{row_index}",
+        f"A{row_index}:E{row_index}",
         [payload],
         value_input_option="USER_ENTERED",
     )
-    logger.info("Baseline atualizado para termo: %s", search_keyword)
+    logger.info("Baseline atualizado para termo: %s [%s]", search_keyword, marketplace)
 
 
 def calibrate_market_baseline(
+    scraper: MultiMarketplaceScraper,
     config: AppConfig,
     target_ws,
     search_keyword: str,
+    marketplace: str,
 ):
-    logger.info("Calibrando baseline para termo: %s", search_keyword)
-    products = scrape_mercadolivre(
-        search_keyword,
-        config.calibration_top_n,
+    logger.info("Calibrando baseline para termo: %s [%s]", search_keyword, marketplace)
+    products = scraper.get_products(
+        marketplace=marketplace,
+        keyword=search_keyword,
+        limit=config.calibration_top_n,
         sort_by_price=False,
     )
     valid_products = filter_valid_products(
@@ -1276,6 +1530,7 @@ def calibrate_market_baseline(
     upsert_market_baseline(
         target_ws=target_ws,
         search_keyword=search_keyword,
+        marketplace=marketplace,
         price_min=baseline_min,
         price_max=baseline_max,
         calibration_timestamp=timestamp,
@@ -1395,8 +1650,10 @@ def process_products(config: AppConfig, data_ws, products: List[Product], search
 
 
 def collect_monitor_products_with_quota(
+    scraper: MultiMarketplaceScraper,
     config: AppConfig,
     search_keyword: str,
+    marketplace: str,
     price_min: float,
     price_max: float,
     quota: int,
@@ -1408,16 +1665,18 @@ def collect_monitor_products_with_quota(
     for page_number in range(1, max_pages + 1):
         start_offset = 1 + (page_number - 1) * 48
         logger.info(
-            "Monitoramento '%s' | página %d/%d | offset=%d",
+            "Monitoramento '%s' [%s] | página %d/%d | offset=%d",
             search_keyword,
+            marketplace,
             page_number,
             max_pages,
             start_offset,
         )
 
-        page_products = scrape_mercadolivre(
-            search_keyword,
-            quota,
+        page_products = scraper.get_products(
+            marketplace=marketplace,
+            keyword=search_keyword,
+            limit=quota,
             price_min=price_min,
             price_max=price_max,
             sort_by_price=True,
@@ -1443,11 +1702,19 @@ def collect_monitor_products_with_quota(
     return collected
 
 
-def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) -> bool:
+def daily_monitor(
+    scraper: MultiMarketplaceScraper,
+    config: AppConfig,
+    data_ws,
+    target_ws,
+    search_keyword: str,
+    marketplace: str,
+) -> bool:
     ensure_target_headers(target_ws)
     ensure_history_headers(data_ws)
 
-    _, baseline_row = get_baseline_for_keyword(target_ws, search_keyword)
+    normalized_marketplace = scraper.normalize_marketplace(marketplace)
+    _, baseline_row = get_baseline_for_keyword(target_ws, search_keyword, normalized_marketplace)
     price_min = safe_float(baseline_row.get("Preco Minimo")) if baseline_row else None
     price_max = safe_float(baseline_row.get("Preco Maximo")) if baseline_row else None
     last_calibration_raw = baseline_row.get("Data Ultima Calibragem") if baseline_row else ""
@@ -1459,10 +1726,17 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
 
     if baseline_row and baseline_expired:
         logger.info(
-            "Calibragem de '%s' com mais de 30 dias. Recalibrando por relevância.",
+            "Calibragem de '%s' [%s] com mais de 30 dias. Recalibrando por relevância.",
             search_keyword,
+            normalized_marketplace,
         )
-        baseline = calibrate_market_baseline(config, target_ws, search_keyword)
+        baseline = calibrate_market_baseline(
+            scraper,
+            config,
+            target_ws,
+            search_keyword,
+            normalized_marketplace,
+        )
         if not baseline:
             return False
         price_min = baseline["min"]
@@ -1470,18 +1744,26 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
 
     if price_min is None or price_max is None or price_max <= price_min:
         logger.warning(
-            "Baseline ausente/inválido para '%s'. Iniciando calibragem.",
+            "Baseline ausente/inválido para '%s' [%s]. Iniciando calibragem.",
             search_keyword,
+            normalized_marketplace,
         )
-        baseline = calibrate_market_baseline(config, target_ws, search_keyword)
+        baseline = calibrate_market_baseline(
+            scraper,
+            config,
+            target_ws,
+            search_keyword,
+            normalized_marketplace,
+        )
         if not baseline:
             return False
         price_min = baseline["min"]
         price_max = baseline["max"]
 
     logger.info(
-        "Monitoramento '%s' com faixa de preço %.2f - %.2f.",
+        "Monitoramento '%s' [%s] com faixa de preço %.2f - %.2f.",
         search_keyword,
+        normalized_marketplace,
         price_min,
         price_max,
     )
@@ -1495,10 +1777,17 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
 
     if not baseline_median_candidates:
         logger.warning(
-            "Não foi possível inferir mediana de baseline para '%s'. Recalibrando.",
+            "Não foi possível inferir mediana de baseline para '%s' [%s]. Recalibrando.",
             search_keyword,
+            normalized_marketplace,
         )
-        baseline = calibrate_market_baseline(config, target_ws, search_keyword)
+        baseline = calibrate_market_baseline(
+            scraper,
+            config,
+            target_ws,
+            search_keyword,
+            normalized_marketplace,
+        )
         if not baseline:
             return False
         price_max = baseline["max"]
@@ -1512,16 +1801,19 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
         dynamic_floor = max(dynamic_floor, config.min_price_threshold)
 
         logger.info(
-            "Tentando monitoramento '%s' com desconto %.0f%% | piso %.2f | teto %.2f",
+            "Tentando monitoramento '%s' [%s] com desconto %.0f%% | piso %.2f | teto %.2f",
             search_keyword,
+            normalized_marketplace,
             step * 100,
             dynamic_floor,
             price_max,
         )
 
         valid_products = collect_monitor_products_with_quota(
+            scraper=scraper,
             config=config,
             search_keyword=search_keyword,
+            marketplace=normalized_marketplace,
             price_min=dynamic_floor,
             price_max=price_max,
             quota=config.monitor_top_n,
@@ -1541,17 +1833,26 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
 
     if not valid_products:
         logger.warning(
-            "Sem resultados válidos após relaxação progressiva para '%s'. Recalibrando de forma definitiva.",
+            "Sem resultados válidos após relaxação progressiva para '%s' [%s]. Recalibrando de forma definitiva.",
             search_keyword,
+            normalized_marketplace,
         )
-        baseline = calibrate_market_baseline(config, target_ws, search_keyword)
+        baseline = calibrate_market_baseline(
+            scraper,
+            config,
+            target_ws,
+            search_keyword,
+            normalized_marketplace,
+        )
         if not baseline:
             return False
 
         final_floor = max(baseline["median"] * (1 - discount_steps[0]), config.min_price_threshold)
         valid_products = collect_monitor_products_with_quota(
+            scraper=scraper,
             config=config,
             search_keyword=search_keyword,
+            marketplace=normalized_marketplace,
             price_min=final_floor,
             price_max=baseline["max"],
             quota=config.monitor_top_n,
@@ -1565,18 +1866,56 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
     return process_products(config, data_ws, valid_products, search_keyword)
 
 
+def get_monitoring_targets(target_ws, fallback_keywords: List[str]) -> List[Dict[str, str]]:
+    ensure_target_headers(target_ws)
+    rows = target_ws.get_all_records()
+    targets: List[Dict[str, str]] = []
+    seen = set()
+
+    for row in rows:
+        term = str(row.get("Termo Buscado", "") or "").strip()
+        if not term:
+            continue
+
+        marketplace = str(row.get("Marketplace", "") or "").strip().lower() or DEFAULT_MARKETPLACE
+        key = (term.lower(), marketplace)
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append({"keyword": term, "marketplace": marketplace})
+
+    if targets:
+        return targets
+
+    return [
+        {"keyword": keyword, "marketplace": DEFAULT_MARKETPLACE}
+        for keyword in fallback_keywords
+    ]
+
+
 def main() -> int:
     try:
         config = load_config()
+        scraper = MultiMarketplaceScraper(build_browser_context)
         sh = open_spreadsheet(config)
         data_ws = get_or_create_worksheet(sh, config.data_sheet_name)
         target_ws = get_or_create_worksheet(sh, config.target_sheet_name)
 
         processed_any_term = False
+        monitoring_targets = get_monitoring_targets(target_ws, config.search_keywords)
 
-        for keyword in config.search_keywords:
-            logger.info("Iniciando busca para termo: %s", keyword)
-            processed = daily_monitor(config, data_ws, target_ws, keyword)
+        for target in monitoring_targets:
+            keyword = target["keyword"]
+            marketplace = target["marketplace"]
+            logger.info("Iniciando busca para termo: %s [%s]", keyword, marketplace)
+            processed = daily_monitor(
+                scraper=scraper,
+                config=config,
+                data_ws=data_ws,
+                target_ws=target_ws,
+                search_keyword=keyword,
+                marketplace=marketplace,
+            )
             processed_any_term = processed_any_term or processed
 
         if not processed_any_term:
