@@ -1356,19 +1356,40 @@ def process_products(config: AppConfig, data_ws, products: List[Product], search
         logger.info("Termo atualizado no histórico: %s", search_keyword)
 
     if existing_row is not None and variation_pct < 0:
-        old_reference = previous_historical_min if previous_historical_min is not None else historical_min
-        message = (
-            f"📉 Novo recorde de preço para '{search_keyword}'!\n"
-            f"Preço atual: R$ {brl(current_price)}\n"
-            f"Recorde anterior: R$ {brl(old_reference)}\n"
-            f"Variação: {variation_pct:.2f}%\n"
-            f"Link: {current_link}"
-        )
-        if config.telegram_enabled:
-            send_telegram_message(config.telegram_token, config.telegram_chat_id, message)
-            logger.info("Alerta de novo menor preço enviado.")
+        median_reference = safe_float(existing_row.get("Preço Médio"))
+        if median_reference is None or median_reference <= 0:
+            median_reference = median_price
+
+        discount_pct = 0.0
+        if median_reference and median_reference > 0:
+            discount_pct = (median_reference - current_price) / median_reference
+
+        if discount_pct >= 0.10:
+            old_reference = previous_historical_min if previous_historical_min is not None else historical_min
+            message = (
+                f"📉 Novo recorde de preço para '{search_keyword}'!\n"
+                f"Preço atual: R$ {brl(current_price)}\n"
+                f"Mediana referência: R$ {brl(median_reference)}\n"
+                f"Desconto vs mediana: {discount_pct * 100:.2f}%\n"
+                f"Recorde anterior: R$ {brl(old_reference)}\n"
+                f"Variação histórica: {variation_pct:.2f}%\n"
+                f"Link: {current_link}"
+            )
+            if config.telegram_enabled:
+                send_telegram_message(config.telegram_token, config.telegram_chat_id, message)
+                logger.info(
+                    "Alerta enviado para '%s' | desconto vs mediana %.2f%%",
+                    search_keyword,
+                    discount_pct * 100,
+                )
+            else:
+                logger.info("Telegram desabilitado. Mensagem gerada: %s", message)
         else:
-            logger.info("Telegram desabilitado. Mensagem gerada: %s", message)
+            logger.info(
+                "Desconto insuficiente para alerta em '%s': %.2f%% (< 10%%).",
+                search_keyword,
+                discount_pct * 100,
+            )
 
     return True
 
