@@ -53,7 +53,6 @@ BLACKLIST_WORDS = [
     "carcaca",
     "carcaça",
     "peca",
-    "peça",
     "reparo",
     "conserto",
     "manutencao",
@@ -1459,35 +1458,82 @@ def daily_monitor(config: AppConfig, data_ws, target_ws, search_keyword: str) ->
         price_min,
         price_max,
     )
-    valid_products = collect_monitor_products_with_quota(
-        config=config,
-        search_keyword=search_keyword,
-        price_min=price_min,
-        price_max=price_max,
-        quota=config.monitor_top_n,
-        max_pages=3,
-    )
+    discount_steps = [0.50, 0.40, 0.30, 0.20, 0.10]
 
-    if not valid_products:
+    baseline_median_candidates = []
+    if price_min is not None and price_min > 0:
+        baseline_median_candidates.append(price_min / 0.50)
+    if price_max is not None and price_max > 0:
+        baseline_median_candidates.append(price_max / 1.10)
+
+    if not baseline_median_candidates:
         logger.warning(
-            "Busca monitorada sem resultados válidos após 3 páginas para '%s'. Recalibrando automaticamente.",
+            "Não foi possível inferir mediana de baseline para '%s'. Recalibrando.",
             search_keyword,
         )
         baseline = calibrate_market_baseline(config, target_ws, search_keyword)
         if not baseline:
             return False
+        price_max = baseline["max"]
+        baseline_median = baseline["median"]
+    else:
+        baseline_median = sum(baseline_median_candidates) / len(baseline_median_candidates)
+
+    valid_products: List[Product] = []
+    for idx, step in enumerate(discount_steps):
+        dynamic_floor = baseline_median * (1 - step)
+        dynamic_floor = max(dynamic_floor, config.min_price_threshold)
+
+        logger.info(
+            "Tentando monitoramento '%s' com desconto %.0f%% | piso %.2f | teto %.2f",
+            search_keyword,
+            step * 100,
+            dynamic_floor,
+            price_max,
+        )
+
         valid_products = collect_monitor_products_with_quota(
             config=config,
             search_keyword=search_keyword,
-            price_min=baseline["min"],
+            price_min=dynamic_floor,
+            price_max=price_max,
+            quota=config.monitor_top_n,
+            max_pages=3,
+        )
+
+        if valid_products:
+            break
+
+        if idx < len(discount_steps) - 1:
+            next_step = discount_steps[idx + 1]
+            logger.warning(
+                "Lixo detectado a %.0f%%. Reduzindo desconto para %.0f%%.",
+                step * 100,
+                next_step * 100,
+            )
+
+    if not valid_products:
+        logger.warning(
+            "Sem resultados válidos após relaxação progressiva para '%s'. Recalibrando de forma definitiva.",
+            search_keyword,
+        )
+        baseline = calibrate_market_baseline(config, target_ws, search_keyword)
+        if not baseline:
+            return False
+
+        final_floor = max(baseline["median"] * (1 - discount_steps[0]), config.min_price_threshold)
+        valid_products = collect_monitor_products_with_quota(
+            config=config,
+            search_keyword=search_keyword,
+            price_min=final_floor,
             price_max=baseline["max"],
             quota=config.monitor_top_n,
             max_pages=3,
         )
 
-    if not valid_products:
-        logger.warning("Mesmo após recalibragem, sem resultados válidos para '%s'.", search_keyword)
-        return False
+        if not valid_products:
+            logger.warning("Mesmo após recalibragem, sem resultados válidos para '%s'.", search_keyword)
+            return False
 
     return process_products(config, data_ws, valid_products, search_keyword)
 
