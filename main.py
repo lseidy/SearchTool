@@ -1,4 +1,5 @@
 import json
+import asyncio
 import logging
 import os
 import re
@@ -1543,6 +1544,75 @@ def calibrate_market_baseline(
     }
 
 
+def calibrate_global_market_baseline(
+    scraper: MultiMarketplaceScraper,
+    config: AppConfig,
+    target_ws,
+    search_keyword: str,
+):
+    logger.info("Calibrando baseline GLOBAL para termo: %s", search_keyword)
+    global_pool: List[Dict[str, Any]] = []
+
+    for marketplace in scraper.SITE_CONFIG.keys():
+        products = scraper.get_products(
+            marketplace=marketplace,
+            keyword=search_keyword,
+            limit=config.calibration_top_n,
+            sort_by_price=False,
+        )
+        valid_products = filter_valid_products(
+            products=products,
+            search_keyword=search_keyword,
+            min_price_threshold=config.min_price_threshold,
+        )
+
+        for product in valid_products:
+            global_pool.append(
+                {
+                    "store": marketplace,
+                    "title": product.name,
+                    "price": product.price,
+                    "url": product.url,
+                }
+            )
+
+    if not global_pool:
+        logger.warning("Calibragem GLOBAL sem produtos válidos para o termo: %s", search_keyword)
+        return None
+
+    df = pd.DataFrame(global_pool)
+    if df.empty:
+        logger.warning("Calibragem GLOBAL retornou DataFrame vazio para o termo: %s", search_keyword)
+        return None
+
+    max_price = float(df["price"].max())
+    robust_floor = max_price * 0.50
+    df = df[df["price"] >= robust_floor]
+    if df.empty:
+        logger.warning("Filtro de robustez GLOBAL removeu todos os itens para: %s", search_keyword)
+        return None
+
+    median_price = float(df["price"].median())
+    baseline_min = median_price * 0.50
+    baseline_max = median_price * 1.10
+    timestamp = now_brt_str()
+
+    upsert_market_baseline(
+        target_ws=target_ws,
+        search_keyword=search_keyword,
+        marketplace="global",
+        price_min=baseline_min,
+        price_max=baseline_max,
+        calibration_timestamp=timestamp,
+    )
+
+    return {
+        "median": median_price,
+        "min": baseline_min,
+        "max": baseline_max,
+    }
+
+
 def process_products(config: AppConfig, data_ws, products: List[Product], search_keyword: str) -> bool:
     ensure_history_headers(data_ws)
 
@@ -1702,19 +1772,64 @@ def collect_monitor_products_with_quota(
     return collected
 
 
+async def fetch_all_marketplaces(
+    scraper: MultiMarketplaceScraper,
+    config: AppConfig,
+    product_name: str,
+    discount_step: float,
+    baseline_median: float,
+    price_cap: float,
+) -> List[Dict[str, Any]]:
+    dynamic_floor = max(baseline_median * (1 - discount_step), config.min_price_threshold)
+    marketplaces = list(scraper.SITE_CONFIG.keys())
+
+    tasks = [
+        asyncio.to_thread(
+            collect_monitor_products_with_quota,
+            scraper,
+            config,
+            product_name,
+            marketplace,
+            dynamic_floor,
+            price_cap,
+            config.monitor_top_n,
+            3,
+        )
+        for marketplace in marketplaces
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    global_pool: List[Dict[str, Any]] = []
+
+    for marketplace, result in zip(marketplaces, results):
+        if isinstance(result, Exception):
+            logger.warning("Falha na busca %s para '%s': %s", marketplace, product_name, result)
+            continue
+
+        for product in result:
+            global_pool.append(
+                {
+                    "store": marketplace,
+                    "title": product.name,
+                    "price": product.price,
+                    "url": product.url,
+                }
+            )
+
+    return global_pool
+
+
 def daily_monitor(
     scraper: MultiMarketplaceScraper,
     config: AppConfig,
     data_ws,
     target_ws,
     search_keyword: str,
-    marketplace: str,
 ) -> bool:
     ensure_target_headers(target_ws)
     ensure_history_headers(data_ws)
 
-    normalized_marketplace = scraper.normalize_marketplace(marketplace)
-    _, baseline_row = get_baseline_for_keyword(target_ws, search_keyword, normalized_marketplace)
+    _, baseline_row = get_baseline_for_keyword(target_ws, search_keyword, "global")
     price_min = safe_float(baseline_row.get("Preco Minimo")) if baseline_row else None
     price_max = safe_float(baseline_row.get("Preco Maximo")) if baseline_row else None
     last_calibration_raw = baseline_row.get("Data Ultima Calibragem") if baseline_row else ""
@@ -1726,16 +1841,14 @@ def daily_monitor(
 
     if baseline_row and baseline_expired:
         logger.info(
-            "Calibragem de '%s' [%s] com mais de 30 dias. Recalibrando por relevância.",
+            "Calibragem GLOBAL de '%s' com mais de 30 dias. Recalibrando por relevância.",
             search_keyword,
-            normalized_marketplace,
         )
-        baseline = calibrate_market_baseline(
+        baseline = calibrate_global_market_baseline(
             scraper,
             config,
             target_ws,
             search_keyword,
-            normalized_marketplace,
         )
         if not baseline:
             return False
@@ -1744,16 +1857,14 @@ def daily_monitor(
 
     if price_min is None or price_max is None or price_max <= price_min:
         logger.warning(
-            "Baseline ausente/inválido para '%s' [%s]. Iniciando calibragem.",
+            "Baseline GLOBAL ausente/inválido para '%s'. Iniciando calibragem.",
             search_keyword,
-            normalized_marketplace,
         )
-        baseline = calibrate_market_baseline(
+        baseline = calibrate_global_market_baseline(
             scraper,
             config,
             target_ws,
             search_keyword,
-            normalized_marketplace,
         )
         if not baseline:
             return False
@@ -1761,9 +1872,8 @@ def daily_monitor(
         price_max = baseline["max"]
 
     logger.info(
-        "Monitoramento '%s' [%s] com faixa de preço %.2f - %.2f.",
+        "Monitoramento GLOBAL '%s' com faixa de preço %.2f - %.2f.",
         search_keyword,
-        normalized_marketplace,
         price_min,
         price_max,
     )
@@ -1777,16 +1887,14 @@ def daily_monitor(
 
     if not baseline_median_candidates:
         logger.warning(
-            "Não foi possível inferir mediana de baseline para '%s' [%s]. Recalibrando.",
+            "Não foi possível inferir mediana de baseline GLOBAL para '%s'. Recalibrando.",
             search_keyword,
-            normalized_marketplace,
         )
-        baseline = calibrate_market_baseline(
+        baseline = calibrate_global_market_baseline(
             scraper,
             config,
             target_ws,
             search_keyword,
-            normalized_marketplace,
         )
         if not baseline:
             return False
@@ -1795,78 +1903,122 @@ def daily_monitor(
     else:
         baseline_median = sum(baseline_median_candidates) / len(baseline_median_candidates)
 
-    valid_products: List[Product] = []
+    global_pool: List[Dict[str, Any]] = []
     for idx, step in enumerate(discount_steps):
-        dynamic_floor = baseline_median * (1 - step)
-        dynamic_floor = max(dynamic_floor, config.min_price_threshold)
+        dynamic_floor = max(baseline_median * (1 - step), config.min_price_threshold)
 
         logger.info(
-            "Tentando monitoramento '%s' [%s] com desconto %.0f%% | piso %.2f | teto %.2f",
+            "Tentando monitoramento GLOBAL '%s' com desconto %.0f%% | piso %.2f | teto %.2f",
             search_keyword,
-            normalized_marketplace,
             step * 100,
             dynamic_floor,
             price_max,
         )
 
-        valid_products = collect_monitor_products_with_quota(
-            scraper=scraper,
-            config=config,
-            search_keyword=search_keyword,
-            marketplace=normalized_marketplace,
-            price_min=dynamic_floor,
-            price_max=price_max,
-            quota=config.monitor_top_n,
-            max_pages=3,
+        global_pool = asyncio.run(
+            fetch_all_marketplaces(
+                scraper=scraper,
+                config=config,
+                product_name=search_keyword,
+                discount_step=step,
+                baseline_median=baseline_median,
+                price_cap=price_max,
+            )
         )
 
-        if valid_products:
+        if global_pool:
             break
 
         if idx < len(discount_steps) - 1:
             next_step = discount_steps[idx + 1]
             logger.warning(
-                "Lixo detectado a %.0f%%. Reduzindo desconto para %.0f%%.",
+                "Pool vazio a %.0f%%. Reduzindo desconto para %.0f%%.",
                 step * 100,
                 next_step * 100,
             )
 
-    if not valid_products:
+    if not global_pool:
         logger.warning(
-            "Sem resultados válidos após relaxação progressiva para '%s' [%s]. Recalibrando de forma definitiva.",
+            "Sem resultados válidos após relaxação progressiva GLOBAL para '%s'. Recalibrando de forma definitiva.",
             search_keyword,
-            normalized_marketplace,
         )
-        baseline = calibrate_market_baseline(
-            scraper,
-            config,
-            target_ws,
-            search_keyword,
-            normalized_marketplace,
+        baseline = calibrate_global_market_baseline(
+            scraper=scraper,
+            config=config,
+            target_ws=target_ws,
+            search_keyword=search_keyword,
         )
         if not baseline:
             return False
 
-        final_floor = max(baseline["median"] * (1 - discount_steps[0]), config.min_price_threshold)
-        valid_products = collect_monitor_products_with_quota(
-            scraper=scraper,
-            config=config,
-            search_keyword=search_keyword,
-            marketplace=normalized_marketplace,
-            price_min=final_floor,
-            price_max=baseline["max"],
-            quota=config.monitor_top_n,
-            max_pages=3,
+        global_pool = asyncio.run(
+            fetch_all_marketplaces(
+                scraper=scraper,
+                config=config,
+                product_name=search_keyword,
+                discount_step=discount_steps[0],
+                baseline_median=baseline["median"],
+                price_cap=baseline["max"],
+            )
         )
 
-        if not valid_products:
-            logger.warning("Mesmo após recalibragem, sem resultados válidos para '%s'.", search_keyword)
-            return False
+    if not global_pool:
+        logger.warning("Mesmo após recalibragem GLOBAL, sem resultados válidos para '%s'.", search_keyword)
+        return False
 
-    return process_products(config, data_ws, valid_products, search_keyword)
+    global_df = pd.DataFrame(global_pool)
+    if global_df.empty:
+        logger.warning("Pool GLOBAL vazio para '%s'.", search_keyword)
+        return False
+
+    global_median = float(global_df["price"].median())
+    winner_idx = global_df["price"].idxmin()
+    winner_price = float(global_df.loc[winner_idx, "price"])
+    winner_url = str(global_df.loc[winner_idx, "url"])
+    winner_title = str(global_df.loc[winner_idx, "title"])
+    winner_store = str(global_df.loc[winner_idx, "store"])
+
+    winner_discount = 0.0
+    if global_median > 0:
+        winner_discount = (global_median - winner_price) / global_median
+
+    processed = process_products(
+        config,
+        data_ws,
+        [Product(name=winner_title, price=winner_price, url=winner_url)],
+        search_keyword,
+    )
+
+    if winner_discount >= 0.10:
+        message = (
+            f"🏆 Melhor oferta global para '{search_keyword}'!\n"
+            f"Loja: {winner_store}\n"
+            f"Produto: {winner_title}\n"
+            f"Preço: R$ {brl(winner_price)}\n"
+            f"Mediana global: R$ {brl(global_median)}\n"
+            f"Desconto: {winner_discount * 100:.2f}%\n"
+            f"Link: {winner_url}"
+        )
+        if config.telegram_enabled:
+            send_telegram_message(config.telegram_token, config.telegram_chat_id, message)
+            logger.info("Alerta GLOBAL enviado para '%s'.", search_keyword)
+        else:
+            logger.info("Telegram desabilitado. Mensagem global gerada: %s", message)
+    else:
+        logger.info(
+            "Desconto global insuficiente para '%s': %.2f%% (< 10%%).",
+            search_keyword,
+            winner_discount * 100,
+        )
+
+    return processed
 
 
-def get_monitoring_targets(target_ws, fallback_keywords: List[str]) -> List[Dict[str, str]]:
+def get_monitoring_targets(
+    scraper: MultiMarketplaceScraper,
+    target_ws,
+    fallback_keywords: List[str],
+) -> List[Dict[str, str]]:
     ensure_target_headers(target_ws)
     rows = target_ws.get_all_records()
     targets: List[Dict[str, str]] = []
@@ -1877,20 +2029,19 @@ def get_monitoring_targets(target_ws, fallback_keywords: List[str]) -> List[Dict
         if not term:
             continue
 
-        marketplace = str(row.get("Marketplace", "") or "").strip().lower() or DEFAULT_MARKETPLACE
-        key = (term.lower(), marketplace)
+        key = term.lower()
         if key in seen:
             continue
         seen.add(key)
-        targets.append({"keyword": term, "marketplace": marketplace})
+        targets.append({"keyword": term})
 
     if targets:
         return targets
 
-    return [
-        {"keyword": keyword, "marketplace": DEFAULT_MARKETPLACE}
-        for keyword in fallback_keywords
-    ]
+    for keyword in fallback_keywords:
+        targets.append({"keyword": keyword})
+
+    return targets
 
 
 def main() -> int:
@@ -1902,19 +2053,17 @@ def main() -> int:
         target_ws = get_or_create_worksheet(sh, config.target_sheet_name)
 
         processed_any_term = False
-        monitoring_targets = get_monitoring_targets(target_ws, config.search_keywords)
+        monitoring_targets = get_monitoring_targets(scraper, target_ws, config.search_keywords)
 
         for target in monitoring_targets:
             keyword = target["keyword"]
-            marketplace = target["marketplace"]
-            logger.info("Iniciando busca para termo: %s [%s]", keyword, marketplace)
+            logger.info("Iniciando busca global para termo: %s", keyword)
             processed = daily_monitor(
                 scraper=scraper,
                 config=config,
                 data_ws=data_ws,
                 target_ws=target_ws,
                 search_keyword=keyword,
-                marketplace=marketplace,
             )
             processed_any_term = processed_any_term or processed
 
