@@ -343,6 +343,12 @@ class MultiMarketplaceScraper:
                 return []
 
             cards = page.query_selector_all(selectors.get("cards", ""))
+            logger.info(
+                "Busca %s para '%s' carregada | cards encontrados: %d",
+                site_key,
+                keyword,
+                len(cards),
+            )
             for card in cards:
                 link_el = card.query_selector(selectors.get("link", ""))
                 title_el = card.query_selector(selectors.get("title", ""))
@@ -378,7 +384,17 @@ class MultiMarketplaceScraper:
             context.close()
             browser.close()
 
-        return sanitize_products(products)
+        sanitized_products = sanitize_products(products)
+        logger.info(
+            "Resultados %s para '%s' | urls unicas: %d | produtos extraidos: %d | produtos validos: %d",
+            site_key,
+            keyword,
+            len(seen),
+            len(products),
+            len(sanitized_products),
+        )
+
+        return sanitized_products
 
 
 def parse_search_keywords() -> List[str]:
@@ -1805,6 +1821,13 @@ async def fetch_all_marketplaces(
         if isinstance(result, Exception):
             logger.warning("Falha na busca %s para '%s': %s", marketplace, product_name, result)
             continue
+
+        logger.info(
+            "Coleta GLOBAL '%s' | loja=%s | urls/produtos validos encontrados: %d",
+            product_name,
+            marketplace,
+            len(result),
+        )
 
         for product in result:
             global_pool.append(
