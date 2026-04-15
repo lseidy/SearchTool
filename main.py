@@ -45,6 +45,7 @@ TITLE_BLACKLIST_EXACT = {
 BLACKLIST_WORDS = [
     "capa",
     "case",
+    "cartão",
     "pelicula",
     "película",
     "adesivo",
@@ -532,7 +533,21 @@ def normalize_title_for_match(title: str) -> str:
     return normalized
 
 
-def is_valid_product_url(url: str) -> bool:
+def is_valid_marketplace_url(url: str) -> bool:
+    if not url or not re.match(r"^https?://", url, re.IGNORECASE):
+        return False
+
+    allowed_hosts = [
+        "mercadolivre.com.br",
+        "amazon.com.br",
+        "shopee.com.br",
+        "magazineluiza.com.br",
+    ]
+    lowered = url.lower()
+    return any(host in lowered for host in allowed_hosts)
+
+
+def is_valid_mercadolivre_product_url(url: str) -> bool:
     return bool(url and re.search(r"/(MLB-|p/MLB)", url, re.IGNORECASE))
 
 
@@ -549,7 +564,7 @@ def sanitize_products(products: List[Product]) -> List[Product]:
         price = safe_float(product.price)
         title = (product.name or "").strip()
 
-        if not is_valid_product_url(url):
+        if not is_valid_marketplace_url(url):
             continue
         if price is None or price <= 0.0:
             continue
@@ -873,7 +888,7 @@ def extract_products_from_ldjson(html: str, limit: int) -> List[Dict[str, str]]:
                 if isinstance(offers, dict):
                     price = str(offers.get("price", "") or "").strip()
 
-                if not url or url in seen or not is_valid_product_url(url):
+                if not url or url in seen or not is_valid_mercadolivre_product_url(url):
                     continue
 
                 products.append({"url": url, "title": name, "price_text": price})
@@ -963,7 +978,7 @@ def scrape_top_product_links(
                     continue
                 if url.startswith("/"):
                     url = f"https://www.mercadolivre.com.br{url}"
-                if not is_valid_product_url(url):
+                if not is_valid_mercadolivre_product_url(url):
                     continue
 
                 title = (str(item.get("title", "") or "").strip() or "Produto")
@@ -998,7 +1013,7 @@ def scrape_top_product_links(
                 url = normalize_url(str(link.get("href", "") or ""))
                 if not url or url in seen_urls:
                     continue
-                if not is_valid_product_url(url):
+                if not is_valid_mercadolivre_product_url(url):
                     continue
 
                 title = (str(link.get("text", "") or "").strip() or "Produto")
@@ -1035,7 +1050,7 @@ def scrape_top_product_links(
             if not url or url in seen_urls:
                 continue
 
-            if not is_valid_product_url(url):
+            if not is_valid_mercadolivre_product_url(url):
                 continue
 
             title = (title_el.inner_text().strip() if title_el else "Produto")
