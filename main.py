@@ -1,5 +1,6 @@
 import json
 import asyncio
+from html import escape
 import logging
 import os
 import re
@@ -119,6 +120,7 @@ class Product:
     name: str
     price: float
     url: str
+    image_url: Optional[str] = None
 
 
 @dataclass
@@ -149,6 +151,7 @@ class MultiMarketplaceScraper:
                 "price_whole": "span.andes-money-amount__fraction",
                 "price_fraction": "span.andes-money-amount__cents",
                 "link": "a.ui-search-link, a.poly-component__title, a.poly-card__title, h3 a",
+                "image": "img.poly-component__picture, img.ui-search-result-image__element, img",
             },
         },
         "amazon": {
@@ -157,11 +160,12 @@ class MultiMarketplaceScraper:
             "range_mode": "query_cents",
             "range_param": "rh=p_36:{min}-{max}",
             "selectors": {
-                "cards": "div.s-result-item[data-component-type='s-search-result']",
+                "cards": "div[data-component-type='s-search-result']",
                 "title": "h2 span",
                 "price_whole": "span.a-price-whole",
                 "price_fraction": "span.a-price-fraction",
                 "link": "h2 a.a-link-normal",
+                "image": "img.s-image",
             },
         },
         "shopee": {
@@ -174,6 +178,7 @@ class MultiMarketplaceScraper:
                 "price_whole": "span:has-text('R$'), div:has-text('R$')",
                 "price_fraction": "",
                 "link": "a[data-sqe='link'], a.contents",
+                "image": "img",
             },
         },
         "magalu": {
@@ -181,11 +186,12 @@ class MultiMarketplaceScraper:
             "sort_lowest": "sortOrientation=asc&sortType=price",
             "range_mode": "query_magalu_filter",
             "selectors": {
-                "cards": "li[data-testid='product-card'], div[data-testid='product-card-container']",
-                "title": "h2[data-testid='product-title'], h2",
-                "price_whole": "p[data-testid='price-value'], span[data-testid='price-value']",
+                "cards": "[data-testid='product-card-content'], [data-testid='product-card-container']",
+                "title": "[data-testid='product-title']",
+                "price_whole": "[data-testid='price-value']",
                 "price_fraction": "",
-                "link": "a[data-testid='product-card-container'], a",
+                "link": "[data-testid='product-card-container'], a",
+                "image": "img",
             },
         },
     }
@@ -278,9 +284,36 @@ class MultiMarketplaceScraper:
                 fraction_text = (fraction_el.inner_text() or "").strip()
 
         if whole_text:
+            whole_digits = re.sub(r"\D", "", whole_text)
+            fraction_digits = re.sub(r"\D", "", fraction_text)
+
+            if whole_digits and fraction_digits:
+                return parse_price_to_float(f"{whole_digits},{fraction_digits[:2]}")
+            if whole_digits:
+                return parse_price_to_float(whole_digits)
+
             if fraction_text:
                 return parse_price_to_float(f"{whole_text},{fraction_text}")
             return parse_price_to_float(whole_text)
+
+        return None
+
+    def extract_image_from_card(self, card, selectors: Dict[str, str]) -> Optional[str]:
+        image_selector = selectors.get("image", "")
+        if not image_selector:
+            return None
+
+        image_el = card.query_selector(image_selector)
+        if not image_el:
+            return None
+
+        for attr in ("src", "data-src", "data-srcset", "srcset"):
+            raw_value = (image_el.get_attribute(attr) or "").strip()
+            if not raw_value:
+                continue
+            image_url = extract_primary_image_url(raw_value)
+            if image_url:
+                return image_url
 
         return None
 
@@ -351,36 +384,77 @@ class MultiMarketplaceScraper:
                 len(cards),
             )
             for card in cards:
-                link_el = card.query_selector(selectors.get("link", ""))
-                title_el = card.query_selector(selectors.get("title", ""))
+                try:
+                    link_el = card.query_selector(selectors.get("link", ""))
+                    title_el = card.query_selector(selectors.get("title", ""))
 
-                if not link_el or not title_el:
+                    if link_el and not (link_el.get_attribute("href") or "").strip():
+                        nested_anchor = link_el.query_selector("a[href]")
+                        if nested_anchor:
+                            link_el = nested_anchor
+                        else:
+                            fallback_anchor = card.query_selector("a[href]")
+                            if fallback_anchor:
+                                link_el = fallback_anchor
+
+                    if not link_el:
+                        link_el = card.query_selector("a[href]")
+
+                    if not title_el:
+                        continue
+
+                    raw_url = (link_el.get_attribute("href") or "").strip() if link_el else ""
+                    if not raw_url:
+                        raw_url = (card.evaluate(
+                            """
+                            (el) => {
+                                const direct = el.querySelector('a[href]');
+                                if (direct) return direct.getAttribute('href') || direct.href || '';
+
+                                const parentAnchor = el.closest('a[href]');
+                                if (parentAnchor) return parentAnchor.getAttribute('href') || parentAnchor.href || '';
+
+                                const parent = el.parentElement;
+                                if (parent) {
+                                    const siblingAnchor = parent.querySelector('a[href]');
+                                    if (siblingAnchor) return siblingAnchor.getAttribute('href') || siblingAnchor.href || '';
+                                }
+                                return '';
+                            }
+                            """
+                        ) or "").strip()
+
+                    if site_key == "amazon" and (raw_url.startswith("/dp/") or raw_url.startswith("/s?")):
+                        raw_url = f"https://www.amazon.com.br{raw_url}"
+                    elif site_key == "amazon" and raw_url.startswith("/"):
+                        raw_url = f"https://www.amazon.com.br{raw_url}"
+                    elif raw_url.startswith("/"):
+                        # Dominio base por marketplace
+                        base_domain = {
+                            "shopee": "https://shopee.com.br",
+                            "magalu": "https://www.magazineluiza.com.br",
+                        }.get(site_key, "")
+                        raw_url = f"{base_domain}{raw_url}" if base_domain else raw_url
+
+                    url = normalize_url(raw_url)
+                    title = (title_el.inner_text() or "").strip()
+
+                    if not url or not title or url in seen:
+                        continue
+
+                    price = self.extract_price_from_card(card, selectors)
+                    if price is None:
+                        continue
+
+                    image_url = self.extract_image_from_card(card, selectors)
+
+                    seen.add(url)
+                    products.append(Product(name=title, price=price, url=url, image_url=image_url))
+                    if len(products) >= limit:
+                        break
+                except Exception as card_exc:
+                    logger.debug("Falha ao extrair card em %s: %s", site_key, card_exc)
                     continue
-
-                raw_url = (link_el.get_attribute("href") or "").strip()
-                if raw_url.startswith("/"):
-                    # Dominio base por marketplace
-                    base_domain = {
-                        "amazon": "https://www.amazon.com.br",
-                        "shopee": "https://shopee.com.br",
-                        "magalu": "https://www.magazineluiza.com.br",
-                    }.get(site_key, "")
-                    raw_url = f"{base_domain}{raw_url}" if base_domain else raw_url
-
-                url = normalize_url(raw_url)
-                title = (title_el.inner_text() or "").strip()
-
-                if not url or not title or url in seen:
-                    continue
-
-                price = self.extract_price_from_card(card, selectors)
-                if price is None:
-                    continue
-
-                seen.add(url)
-                products.append(Product(name=title, price=price, url=url))
-                if len(products) >= limit:
-                    break
 
             context.close()
             browser.close()
@@ -487,6 +561,18 @@ def normalize_url(url: str) -> str:
     return url.split("#")[0].split("?")[0].strip()
 
 
+def extract_primary_image_url(raw_value: str) -> Optional[str]:
+    cleaned = (raw_value or "").strip()
+    if not cleaned:
+        return None
+
+    first_chunk = cleaned.split(",", 1)[0].strip()
+    candidate = first_chunk.split(" ", 1)[0].strip()
+    if candidate.startswith("//"):
+        candidate = f"https:{candidate}"
+    return candidate if candidate.startswith("http") else None
+
+
 def format_price_range_for_url(price_min: Optional[float], price_max: Optional[float]) -> str:
     if price_min is None or price_max is None:
         return ""
@@ -532,7 +618,6 @@ def normalize_title_for_match(title: str) -> str:
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
 
-
 def is_valid_marketplace_url(url: str) -> bool:
     if not url or not re.match(r"^https?://", url, re.IGNORECASE):
         return False
@@ -551,6 +636,26 @@ def is_valid_mercadolivre_product_url(url: str) -> bool:
     return bool(url and re.search(r"/(MLB-|p/MLB)", url, re.IGNORECASE))
 
 
+def is_valid_product_url(url: str) -> bool:
+    if not url:
+        return False
+
+    normalized = normalize_url(url).lower()
+    if not normalized.startswith("http"):
+        return False
+
+    if "mercadolivre." in normalized:
+        return bool(re.search(r"/(MLB-|p/MLB)", normalized, re.IGNORECASE))
+
+    if "amazon.com.br" in normalized:
+        return bool(re.search(r"/(dp|gp/product)/", normalized, re.IGNORECASE))
+
+    if "magazineluiza.com.br" in normalized:
+        return "/p/" in normalized
+
+    return True
+
+
 def is_blacklisted_title(title: str) -> bool:
     return normalize_title_for_match(title) in TITLE_BLACKLIST_EXACT
 
@@ -564,7 +669,7 @@ def sanitize_products(products: List[Product]) -> List[Product]:
         price = safe_float(product.price)
         title = (product.name or "").strip()
 
-        if not is_valid_marketplace_url(url):
+        if not is_valid_product_url(url):
             continue
         if price is None or price <= 0.0:
             continue
@@ -574,7 +679,7 @@ def sanitize_products(products: List[Product]) -> List[Product]:
             continue
 
         seen_urls.add(url)
-        sanitized.append(Product(name=title, price=price, url=url))
+        sanitized.append(Product(name=title, price=price, url=url, image_url=product.image_url))
 
     return sanitized
 
@@ -717,7 +822,11 @@ def scrape_mercadolivre_api(
         if price is None:
             continue
 
-        products.append(Product(name=title, price=price, url=permalink))
+        image_url = extract_primary_image_url(
+            str(item.get("thumbnail", "") or item.get("secure_thumbnail", "") or "")
+        )
+
+        products.append(Product(name=title, price=price, url=permalink, image_url=image_url))
 
         if len(products) >= limit:
             break
@@ -815,11 +924,13 @@ def scrape_mercadolivre_http(
         page_html = detail.text
         title = None
         price = None
+        image_url = None
 
         ldjson_products = extract_products_from_ldjson(page_html, limit=1)
         if ldjson_products:
             title = ldjson_products[0].get("title")
             price = parse_price_to_float(ldjson_products[0].get("price_text") or "")
+            image_url = ldjson_products[0].get("image_url")
 
         if not title:
             title_match = re.search(r"<h1[^>]*>(.*?)</h1>", page_html, flags=re.IGNORECASE | re.DOTALL)
@@ -835,8 +946,17 @@ def scrape_mercadolivre_http(
             if meta_price_match:
                 price = parse_price_to_float(meta_price_match.group(1))
 
+        if not image_url:
+            og_image_match = re.search(
+                r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+                page_html,
+                flags=re.IGNORECASE,
+            )
+            if og_image_match:
+                image_url = extract_primary_image_url(og_image_match.group(1))
+
         if title and price is not None:
-            products.append(Product(name=title, price=price, url=url))
+            products.append(Product(name=title, price=price, url=url, image_url=image_url))
 
         if len(products) >= limit:
             break
@@ -883,15 +1003,25 @@ def extract_products_from_ldjson(html: str, limit: int) -> List[Dict[str, str]]:
                 url = normalize_url(str(item.get("url", "") or ""))
                 name = str(item.get("name", "") or "").strip() or "Produto"
                 price = None
+                image_url = None
 
                 offers = item.get("offers")
                 if isinstance(offers, dict):
                     price = str(offers.get("price", "") or "").strip()
 
-                if not url or url in seen or not is_valid_mercadolivre_product_url(url):
+                image_data = item.get("image")
+                if isinstance(image_data, str):
+                    image_url = extract_primary_image_url(image_data)
+                elif isinstance(image_data, list):
+                    for image_item in image_data:
+                        if isinstance(image_item, str):
+                            image_url = extract_primary_image_url(image_item)
+                            if image_url:
+                                break
+                if not url or url in seen or not is_valid_product_url(url):
                     continue
 
-                products.append({"url": url, "title": name, "price_text": price})
+                products.append({"url": url, "title": name, "price_text": price, "image_url": image_url})
                 seen.add(url)
 
                 if len(products) >= limit:
@@ -990,6 +1120,7 @@ def scrape_top_product_links(
                         "url": url,
                         "title": title,
                         "price_text": str(item.get("price_text", "") or "").strip() or None,
+                        "image_url": item.get("image_url"),
                     }
                 )
                 seen_urls.add(url)
@@ -1020,7 +1151,7 @@ def scrape_top_product_links(
                 if validate_with_keyword and not validate_title_match(validate_with_keyword, title):
                     continue
 
-                products.append({"url": url, "title": title, "price_text": None})
+                products.append({"url": url, "title": title, "price_text": None, "image_url": None})
                 seen_urls.add(url)
                 if len(products) >= limit:
                     break
@@ -1064,7 +1195,18 @@ def scrape_top_product_links(
                 if fraction:
                     price_text = f"{fraction},{cents or '00'}"
 
-            products.append({"url": url, "title": title, "price_text": price_text})
+            image_el = card.query_selector("img")
+            image_raw = ""
+            if image_el:
+                image_raw = (
+                    image_el.get_attribute("src")
+                    or image_el.get_attribute("data-src")
+                    or image_el.get_attribute("srcset")
+                    or ""
+                )
+            image_url = extract_primary_image_url(image_raw)
+
+            products.append({"url": url, "title": title, "price_text": price_text, "image_url": image_url})
             seen_urls.add(url)
 
             if len(products) >= limit:
@@ -1155,6 +1297,23 @@ def scrape_product_detail(url: str, fallback_title: str) -> Optional[Product]:
                 if price_value is not None:
                     break
 
+        image_url = None
+        image_selectors = [
+            "meta[property='og:image']",
+            "img.ui-pdp-image",
+            "img.andes-carousel-snapped__figure__image",
+            "img",
+        ]
+        for selector in image_selectors:
+            el = page.query_selector(selector)
+            if not el:
+                continue
+
+            raw_value = (el.get_attribute("content") or el.get_attribute("src") or "").strip()
+            image_url = extract_primary_image_url(raw_value)
+            if image_url:
+                break
+
         context.close()
         browser.close()
 
@@ -1162,7 +1321,7 @@ def scrape_product_detail(url: str, fallback_title: str) -> Optional[Product]:
             logger.warning("Não foi possível extrair preço em: %s", url)
             return None
 
-        return Product(name=title, price=price_value, url=url)
+        return Product(name=title, price=price_value, url=url, image_url=image_url)
 
 
 def scrape_mercadolivre(
@@ -1219,7 +1378,12 @@ def scrape_mercadolivre(
         fallback_price = parse_price_to_float(entry.get("price_text") or "")
         if fallback_price is not None:
             items.append(
-                Product(name=entry["title"], price=fallback_price, url=entry["url"])
+                Product(
+                    name=entry["title"],
+                    price=fallback_price,
+                    url=entry["url"],
+                    image_url=entry.get("image_url"),
+                )
             )
 
     if not items:
@@ -1379,6 +1543,63 @@ def send_telegram_message(token: str, chat_id: str, message: str) -> None:
         json={"chat_id": chat_id, "text": message, "disable_web_page_preview": False},
         timeout=30,
     )
+
+    if response.status_code >= 300:
+        raise RuntimeError(f"Erro no Telegram: {response.status_code} - {response.text}")
+
+
+def enviar_alerta_telegram(
+    produto: str,
+    preco: float,
+    mediana: float,
+    desconto: float,
+    link: str,
+    image_url: Optional[str],
+) -> None:
+    token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        logger.info("Telegram não configurado. Alerta ignorado.")
+        return
+
+    discount_pct = desconto * 100 if abs(desconto) <= 1 else desconto
+    safe_produto = escape(produto or "")
+    safe_link = escape(link or "")
+    caption = (
+        "🎉 <b>Achado do Dia!</b>\n"
+        f"🛒 <b>Produto:</b> <i>{safe_produto}</i>\n\n"
+        f"💰 <b>Preço Agora:</b> R$ <b>{brl(preco)}</b>\n"
+        f"📉 <b>Preço Médio:</b> R$ <b>{brl(mediana)}</b>\n"
+        f"🔥 <b>Desconto:</b> {discount_pct:.2f}% OFF!\n\n"
+        f"🔗 <a href=\"{safe_link}\">Clique aqui para aproveitar!</a>"
+    )
+    if len(caption) > 1024:
+        caption = caption[:1021] + "..."
+
+    if image_url:
+        endpoint = f"https://api.telegram.org/bot{token}/sendPhoto"
+        response = requests.post(
+            endpoint,
+            json={
+                "chat_id": chat_id,
+                "photo": image_url,
+                "caption": caption,
+                "parse_mode": "HTML",
+            },
+            timeout=30,
+        )
+    else:
+        endpoint = f"https://api.telegram.org/bot{token}/sendMessage"
+        response = requests.post(
+            endpoint,
+            json={
+                "chat_id": chat_id,
+                "text": caption,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+            timeout=30,
+        )
 
     if response.status_code >= 300:
         raise RuntimeError(f"Erro no Telegram: {response.status_code} - {response.text}")
@@ -1652,7 +1873,7 @@ def process_products(config: AppConfig, data_ws, products: List[Product], search
         return False
 
     df = pd.DataFrame(
-        [{"name": p.name, "price": p.price, "url": p.url} for p in products]
+        [{"name": p.name, "price": p.price, "url": p.url, "image_url": p.image_url} for p in products]
     )
 
     if df.empty:
@@ -1663,6 +1884,7 @@ def process_products(config: AppConfig, data_ws, products: List[Product], search
     current_price = float(df.loc[min_idx, "price"])
     median_price = float(df["price"].median())
     current_link = str(df.loc[min_idx, "url"])
+    current_image_url = str(df.loc[min_idx, "image_url"] or "").strip() or None
     timestamp = now_brt_str()
 
     rows = data_ws.get_all_records()
@@ -1732,7 +1954,14 @@ def process_products(config: AppConfig, data_ws, products: List[Product], search
                 f"Link: {current_link}"
             )
             if config.telegram_enabled:
-                send_telegram_message(config.telegram_token, config.telegram_chat_id, message)
+                enviar_alerta_telegram(
+                    produto=search_keyword,
+                    preco=current_price,
+                    mediana=median_reference,
+                    desconto=discount_pct,
+                    link=current_link,
+                    image_url=current_image_url,
+                )
                 logger.info(
                     "Alerta enviado para '%s' | desconto vs mediana %.2f%%",
                     search_keyword,
@@ -1851,6 +2080,7 @@ async def fetch_all_marketplaces(
                     "title": product.name,
                     "price": product.price,
                     "url": product.url,
+                    "image_url": product.image_url,
                 }
             )
 
@@ -2015,6 +2245,7 @@ def daily_monitor(
     winner_url = str(global_df.loc[winner_idx, "url"])
     winner_title = str(global_df.loc[winner_idx, "title"])
     winner_store = str(global_df.loc[winner_idx, "store"])
+    winner_image_url = str(global_df.loc[winner_idx, "image_url"] or "").strip() or None
 
     winner_discount = 0.0
     if global_median > 0:
@@ -2023,7 +2254,7 @@ def daily_monitor(
     processed = process_products(
         config,
         data_ws,
-        [Product(name=winner_title, price=winner_price, url=winner_url)],
+        [Product(name=winner_title, price=winner_price, url=winner_url, image_url=winner_image_url)],
         search_keyword,
     )
 
@@ -2038,7 +2269,14 @@ def daily_monitor(
             f"Link: {winner_url}"
         )
         if config.telegram_enabled:
-            send_telegram_message(config.telegram_token, config.telegram_chat_id, message)
+            enviar_alerta_telegram(
+                produto=winner_title,
+                preco=winner_price,
+                mediana=global_median,
+                desconto=winner_discount,
+                link=winner_url,
+                image_url=winner_image_url,
+            )
             logger.info("Alerta GLOBAL enviado para '%s'.", search_keyword)
         else:
             logger.info("Telegram desabilitado. Mensagem global gerada: %s", message)
