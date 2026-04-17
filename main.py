@@ -159,6 +159,8 @@ class MultiMarketplaceScraper:
             "sort_lowest": "s=price-asc-rank",
             "range_mode": "query_cents",
             "range_param": "rh=p_36:{min}-{max}",
+            "range_param_min_only": "rh=p_36:{min}-",
+            "range_param_max_only": "rh=p_36:-{max}",
             "selectors": {
                 "cards": "div[data-component-type='s-search-result']",
                 "title": "h2 span",
@@ -226,38 +228,60 @@ class MultiMarketplaceScraper:
             if price_min is not None and price_max is not None:
                 min_int = max(0, int(round(price_min)))
                 max_int = max(min_int, int(round(price_max)))
-                range_part = f"_PriceRange_{min_int}-{max_int}"
+                range_part = f"_PriceRange_{min_int}BRL-{max_int}BRL"
             return f"{url}{offset_part}{sort_part}{range_part}{build_marketplace_filters_suffix()}"
 
         query_params: List[str] = []
         if sort_by_price and site.get("sort_lowest"):
             query_params.append(site["sort_lowest"])
 
-        if price_min is not None and price_max is not None:
-            min_value = max(0, int(round(price_min)))
-            max_value = max(min_value, int(round(price_max)))
+        if price_min is not None or price_max is not None:
+            min_bound = max(0.0, float(price_min)) if price_min is not None else None
+            max_bound = max(0.0, float(price_max)) if price_max is not None else None
+
+            if min_bound is not None and max_bound is not None and max_bound < min_bound:
+                max_bound = min_bound
+
+            min_value = int(round(min_bound)) if min_bound is not None else 0
+            max_value = int(round(max_bound)) if max_bound is not None else min_value
 
             if site.get("range_mode") == "query_cents":
-                min_value *= 100
-                max_value *= 100
-                range_param = site.get("range_param", "").format(min=min_value, max=max_value)
+                min_cents = int(round(min_bound * 100)) if min_bound is not None else None
+                max_cents = int(round(max_bound * 100)) if max_bound is not None else None
+
+                if min_cents is not None and max_cents is not None:
+                    range_template = site.get("range_param", "")
+                    range_param = range_template.format(min=min_cents, max=max_cents)
+                elif min_cents is not None:
+                    range_template = site.get("range_param_min_only", "rh=p_36:{min}-")
+                    range_param = range_template.format(min=min_cents)
+                elif max_cents is not None:
+                    range_template = site.get("range_param_max_only", "rh=p_36:-{max}")
+                    range_param = range_template.format(max=max_cents)
+                else:
+                    range_param = ""
+
                 if range_param:
                     query_params.append(range_param)
 
             elif site.get("range_mode") == "query_shopee_filter":
                 # Ex.: fe_filter_options=[{"group_name":"PRICE_RANGE","values":["30▶◀150"]}]
+                shopee_min = min_value if min_bound is not None else 0
+                shopee_max = max_value if max_bound is not None else 999999
                 filter_payload = [
                     {
                         "group_name": "PRICE_RANGE",
-                        "values": [f"{min_value}▶◀{max_value}"],
+                        "values": [f"{shopee_min}▶◀{shopee_max}"],
                     }
                 ]
                 query_params.append(f"fe_filter_options={quote_plus(json.dumps(filter_payload, ensure_ascii=False))}")
 
             elif site.get("range_mode") == "query_magalu_filter":
-                # Magalu geralmente usa filtro em centavos: filters=price---5000:2092500
-                min_cents = min_value * 100
-                max_cents = max_value * 100
+                # Magalu usa centavos inteiros (ex.: 6118 => R$ 61,18), então preservamos casas decimais.
+                min_cents = int(round(min_bound * 100)) if min_bound is not None else 0
+                max_cents = int(round(max_bound * 100)) if max_bound is not None else 999999999
+                if max_cents < min_cents:
+                    max_cents = min_cents
                 query_params.append(f"filters=price---{min_cents}:{max_cents}")
 
         if not query_params:
@@ -609,7 +633,7 @@ def format_price_range_for_url(price_min: Optional[float], price_max: Optional[f
 
     min_int = max(0, int(round(price_min)))
     max_int = max(min_int, int(round(price_max)))
-    return f"_PriceRange_{min_int}-{max_int}"
+    return f"_PriceRange_{min_int}BRL-{max_int}BRL"
 
 
 def build_marketplace_filters_suffix() -> str:
@@ -1738,6 +1762,20 @@ def ensure_target_headers(target_ws) -> None:
         target_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
 
 
+def ensure_baseline_headers(baseline_ws) -> None:
+    expected_headers = [
+        "Chat_ID",
+        "Termo Buscado",
+        "Marketplace",
+        "Preco Minimo",
+        "Preco Maximo",
+        "Data Ultima Calibragem",
+    ]
+    current_headers = baseline_ws.row_values(1)
+    if current_headers != expected_headers:
+        baseline_ws.update("A1:F1", [expected_headers], value_input_option="USER_ENTERED")
+
+
 def get_or_create_worksheet(sh, worksheet_name: str, rows: int = 200, cols: int = 10):
     try:
         return sh.worksheet(worksheet_name)
@@ -1746,8 +1784,8 @@ def get_or_create_worksheet(sh, worksheet_name: str, rows: int = 200, cols: int 
         return sh.add_worksheet(title=worksheet_name, rows=rows, cols=cols)
 
 
-def get_baseline_for_keyword(target_ws, search_keyword: str, marketplace: str, chat_id: Optional[str] = None):
-    rows = target_ws.get_all_records()
+def get_baseline_for_keyword(baseline_ws, search_keyword: str, marketplace: str, chat_id: Optional[str] = None):
+    rows = baseline_ws.get_all_records()
     keyword_key = search_keyword.strip().lower()
     marketplace_key = (marketplace or DEFAULT_MARKETPLACE).strip().lower()
     target_chat_id = str(chat_id or "").strip()
@@ -1778,7 +1816,7 @@ def parse_calibration_date(value: str) -> Optional[datetime]:
 
 
 def upsert_market_baseline(
-    target_ws,
+    baseline_ws,
     search_keyword: str,
     marketplace: str,
     price_min: float,
@@ -1786,15 +1824,16 @@ def upsert_market_baseline(
     calibration_timestamp: str,
     chat_id: str = "GLOBAL",
 ) -> None:
-    row_index, _ = get_baseline_for_keyword(target_ws, search_keyword, marketplace, chat_id=chat_id)
+    ensure_baseline_headers(baseline_ws)
+    row_index, _ = get_baseline_for_keyword(baseline_ws, search_keyword, marketplace, chat_id=chat_id)
     payload = [chat_id, search_keyword, marketplace, price_min, price_max, calibration_timestamp]
 
     if row_index is None:
-        target_ws.append_row(payload, value_input_option="USER_ENTERED")
+        baseline_ws.append_row(payload, value_input_option="USER_ENTERED")
         logger.info("Baseline inserido para termo: %s", search_keyword)
         return
 
-    target_ws.update(
+    baseline_ws.update(
         f"A{row_index}:F{row_index}",
         [payload],
         value_input_option="USER_ENTERED",
@@ -1805,7 +1844,7 @@ def upsert_market_baseline(
 def calibrate_market_baseline(
     scraper: MultiMarketplaceScraper,
     config: AppConfig,
-    target_ws,
+    baseline_ws,
     search_keyword: str,
     marketplace: str,
 ):
@@ -1853,7 +1892,7 @@ def calibrate_market_baseline(
     timestamp = now_brt_str()
 
     upsert_market_baseline(
-        target_ws=target_ws,
+        baseline_ws=baseline_ws,
         search_keyword=search_keyword,
         marketplace=marketplace,
         price_min=baseline_min,
@@ -1871,7 +1910,7 @@ def calibrate_market_baseline(
 def calibrate_global_market_baseline(
     scraper: MultiMarketplaceScraper,
     config: AppConfig,
-    target_ws,
+    baseline_ws,
     search_keyword: str,
 ):
     logger.info("Calibrando baseline GLOBAL para termo: %s", search_keyword)
@@ -1922,7 +1961,7 @@ def calibrate_global_market_baseline(
     timestamp = now_brt_str()
 
     upsert_market_baseline(
-        target_ws=target_ws,
+        baseline_ws=baseline_ws,
         search_keyword=search_keyword,
         marketplace="global",
         price_min=baseline_min,
@@ -2219,15 +2258,15 @@ def daily_monitor(
     scraper: MultiMarketplaceScraper,
     config: AppConfig,
     data_ws,
-    target_ws,
+    baseline_ws,
     search_keyword: str,
     alert_chat_id: str,
     item_blacklist_terms: Optional[List[str]] = None,
 ) -> bool:
-    ensure_target_headers(target_ws)
+    ensure_baseline_headers(baseline_ws)
     ensure_history_headers(data_ws)
 
-    _, baseline_row = get_baseline_for_keyword(target_ws, search_keyword, "global", chat_id="GLOBAL")
+    _, baseline_row = get_baseline_for_keyword(baseline_ws, search_keyword, "global", chat_id="GLOBAL")
     price_min = safe_float(baseline_row.get("Preco Minimo")) if baseline_row else None
     price_max = safe_float(baseline_row.get("Preco Maximo")) if baseline_row else None
     last_calibration_raw = baseline_row.get("Data Ultima Calibragem") if baseline_row else ""
@@ -2245,7 +2284,7 @@ def daily_monitor(
         baseline = calibrate_global_market_baseline(
             scraper,
             config,
-            target_ws,
+            baseline_ws,
             search_keyword,
         )
         if not baseline:
@@ -2261,7 +2300,7 @@ def daily_monitor(
         baseline = calibrate_global_market_baseline(
             scraper,
             config,
-            target_ws,
+            baseline_ws,
             search_keyword,
         )
         if not baseline:
@@ -2291,7 +2330,7 @@ def daily_monitor(
         baseline = calibrate_global_market_baseline(
             scraper,
             config,
-            target_ws,
+            baseline_ws,
             search_keyword,
         )
         if not baseline:
@@ -2344,7 +2383,7 @@ def daily_monitor(
         baseline = calibrate_global_market_baseline(
             scraper=scraper,
             config=config,
-            target_ws=target_ws,
+            baseline_ws=baseline_ws,
             search_keyword=search_keyword,
         )
         if not baseline:
@@ -2428,7 +2467,6 @@ def get_monitoring_targets(
     scraper: MultiMarketplaceScraper,
     target_ws,
     fallback_keywords: List[str],
-    default_chat_id: str,
 ) -> List[Dict[str, str]]:
     ensure_target_headers(target_ws)
     rows = target_ws.get_all_records()
@@ -2451,12 +2489,6 @@ def get_monitoring_targets(
         seen.add(key)
         targets.append({"keyword": term, "chat_id": chat_id, "blacklist": blacklist})
 
-    if targets:
-        return targets
-
-    for keyword in fallback_keywords:
-        targets.append({"keyword": keyword, "chat_id": default_chat_id, "blacklist": ""})
-
     return targets
 
 
@@ -2467,14 +2499,24 @@ def main() -> int:
         sh = open_spreadsheet(config)
         data_ws = get_or_create_worksheet(sh, config.data_sheet_name)
         target_ws = get_or_create_worksheet(sh, config.target_sheet_name)
+        baseline_ws = get_or_create_worksheet(
+            sh,
+            os.getenv("BASELINE_SHEET_NAME", "Baselines").strip() or "Baselines",
+        )
 
         processed_any_term = False
         monitoring_targets = get_monitoring_targets(
             scraper,
             target_ws,
             config.search_keywords,
-            default_chat_id=config.telegram_chat_id,
         )
+
+        if not monitoring_targets:
+            logger.warning(
+                "Nenhum alvo com Chat_ID válido em '%s'. Alerts serão enviados somente para quem cadastrou via Telegram.",
+                config.target_sheet_name,
+            )
+            return 0
 
         for target in monitoring_targets:
             keyword = target["keyword"]
@@ -2485,7 +2527,7 @@ def main() -> int:
                 scraper=scraper,
                 config=config,
                 data_ws=data_ws,
-                target_ws=target_ws,
+                baseline_ws=baseline_ws,
                 search_keyword=keyword,
                 alert_chat_id=chat_id,
                 item_blacklist_terms=scoped_blacklist_terms,
