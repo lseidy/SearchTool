@@ -2258,7 +2258,7 @@ def collect_monitor_products_with_quota(
             # Fallback controlado: mantém itens válidos por URL/preço/faixa quando a validação de título elimina tudo.
             relaxed_base = sanitize_products(page_products)
             relaxed_base = [p for p in relaxed_base if p.price >= config.min_price_threshold]
-            relaxed_base = [p for p in relaxed_base if matches_keyword_quantities(search_keyword, p.name)]
+            relaxed_base = [p for p in relaxed_base if validate_title_match(search_keyword, p.name)]
             if item_blacklist_terms:
                 relaxed_base = [
                     p for p in relaxed_base if not contains_item_blacklist_keyword(p.name, item_blacklist_terms)
