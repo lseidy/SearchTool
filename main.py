@@ -75,6 +75,8 @@ PREPOSITION_GUARD_TERMS = [
     "compativel com",
 ]
 
+QUANTITY_PATTERN = re.compile(r"(\d+(?:[\.,]\d+)?)\s*(kg|g|l|ml)\b", re.IGNORECASE)
+
 
 def get_proxy_settings() -> Optional[Dict[str, str]]:
     server = os.getenv("SCRAPER_PROXY_SERVER", "").strip()
@@ -775,6 +777,76 @@ def keyword_tokens(keyword: str) -> List[str]:
     return [token for token in normalize_text(keyword).split() if token]
 
 
+def normalize_match_token(token: str) -> str:
+    normalized = normalize_text(token).strip()
+    if not normalized:
+        return ""
+
+    if normalized.isdigit() or len(normalized) <= 3:
+        return normalized
+
+    # Normalizacao leve de plural em PT-BR para melhorar recall (ex.: grao/graos).
+    if normalized.endswith("oes") or normalized.endswith("aes"):
+        return normalized[:-3] + "ao"
+    if normalized.endswith("aos"):
+        return normalized[:-1]
+    if normalized.endswith("s") and not normalized.endswith("ss"):
+        return normalized[:-1]
+
+    return normalized
+
+
+def normalized_keyword_token_set(text: str) -> set:
+    normalized_tokens = {
+        normalize_match_token(token)
+        for token in keyword_tokens(text)
+    }
+    normalized_tokens.discard("")
+    return normalized_tokens
+
+
+def extract_normalized_quantities(text: str) -> List[str]:
+    normalized = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii").lower()
+    quantities: List[str] = []
+    seen = set()
+
+    for amount_raw, unit_raw in QUANTITY_PATTERN.findall(normalized):
+        try:
+            amount = float(amount_raw.replace(",", "."))
+        except ValueError:
+            continue
+
+        unit = unit_raw.lower()
+        if unit in {"kg", "g"}:
+            value = int(round(amount * 1000)) if unit == "kg" else int(round(amount))
+            key = f"mass:{value}"
+        else:
+            value = int(round(amount * 1000)) if unit == "l" else int(round(amount))
+            key = f"volume:{value}"
+
+        if value <= 0 or key in seen:
+            continue
+        seen.add(key)
+        quantities.append(key)
+
+    return quantities
+
+
+def matches_keyword_quantities(keyword: str, title: str) -> bool:
+    required_quantities = extract_normalized_quantities(keyword)
+    if not required_quantities:
+        return True
+
+    title_quantities = set(extract_normalized_quantities(title))
+    return all(qty in title_quantities for qty in required_quantities)
+
+
+def keyword_core_tokens(keyword: str) -> List[str]:
+    # Remove explicit quantity markers to avoid duplicate validation with quantity matching.
+    keyword_wo_qty = QUANTITY_PATTERN.sub(" ", keyword or "")
+    return [token for token in normalize_text(keyword_wo_qty).split() if token]
+
+
 def contains_blacklist_word(title: str) -> bool:
     normalized_title = normalize_text(title)
     if not normalized_title:
@@ -807,12 +879,18 @@ def validate_title_match(keyword: str, title: str) -> bool:
         return False
     if has_suspicious_preposition_before_keyword(keyword, title):
         return False
+    if not matches_keyword_quantities(keyword, title):
+        return False
 
-    required_tokens = keyword_tokens(keyword)
+    required_tokens = {
+        normalize_match_token(token)
+        for token in keyword_core_tokens(keyword)
+        if normalize_match_token(token)
+    }
     if not required_tokens:
         return True
 
-    title_tokens = set(keyword_tokens(title))
+    title_tokens = normalized_keyword_token_set(title)
     return all(token in title_tokens for token in required_tokens)
 
 
@@ -2145,6 +2223,7 @@ def collect_monitor_products_with_quota(
             # Fallback controlado: mantém itens válidos por URL/preço/faixa quando a validação de título elimina tudo.
             relaxed_base = sanitize_products(page_products)
             relaxed_base = [p for p in relaxed_base if p.price >= config.min_price_threshold]
+            relaxed_base = [p for p in relaxed_base if matches_keyword_quantities(search_keyword, p.name)]
             if item_blacklist_terms:
                 relaxed_base = [
                     p for p in relaxed_base if not contains_item_blacklist_keyword(p.name, item_blacklist_terms)
