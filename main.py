@@ -1879,10 +1879,11 @@ def ensure_baseline_headers(baseline_ws) -> None:
         "Preco Minimo",
         "Preco Maximo",
         "Data Ultima Calibragem",
+        "Mediana",
     ]
     current_headers = baseline_ws.row_values(1)
     if current_headers != expected_headers:
-        baseline_ws.update("A1:F1", [expected_headers], value_input_option="USER_ENTERED")
+        baseline_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
 
 
 def ensure_scraper_log_headers(log_ws) -> None:
@@ -1983,11 +1984,14 @@ def upsert_market_baseline(
     price_max: float,
     calibration_timestamp: str,
     chat_id: str = "GLOBAL",
+    median: Optional[float] = None,
 ) -> None:
     ensure_baseline_headers(baseline_ws)
     row_index, _ = get_baseline_for_keyword(baseline_ws, search_keyword, marketplace, chat_id=chat_id)
     price_min_rounded = round(float(price_min), 2)
     price_max_rounded = round(float(price_max), 2)
+    median_value = float(median) if median is not None else ((price_min_rounded / 0.50 + price_max_rounded / 1.10) / 2)
+    median_rounded = round(median_value, 2)
     payload = [
         chat_id,
         search_keyword,
@@ -1995,6 +1999,7 @@ def upsert_market_baseline(
         f"{price_min_rounded:.2f}",
         f"{price_max_rounded:.2f}",
         calibration_timestamp,
+        f"{median_rounded:.2f}",
     ]
 
     if row_index is None:
@@ -2003,7 +2008,7 @@ def upsert_market_baseline(
         return
 
     baseline_ws.update(
-        f"A{row_index}:F{row_index}",
+        f"A{row_index}:G{row_index}",
         [payload],
         value_input_option="USER_ENTERED",
     )
@@ -2067,6 +2072,7 @@ def calibrate_market_baseline(
         price_min=baseline_min,
         price_max=baseline_max,
         calibration_timestamp=timestamp,
+        median=median_price,
     )
 
     return {
@@ -2136,6 +2142,7 @@ def calibrate_global_market_baseline(
         price_min=baseline_min,
         price_max=baseline_max,
         calibration_timestamp=timestamp,
+        median=global_median,
     )
 
     return {
@@ -2484,90 +2491,47 @@ def daily_monitor(
     ensure_baseline_headers(baseline_ws)
     ensure_history_headers(data_ws)
 
-    def resolve_marketplace_baseline(marketplace: str) -> Optional[Dict[str, float]]:
-        _, baseline_row = get_baseline_for_keyword(baseline_ws, search_keyword, marketplace, chat_id="GLOBAL")
-        price_min = safe_float(baseline_row.get("Preco Minimo")) if baseline_row else None
-        price_max = safe_float(baseline_row.get("Preco Maximo")) if baseline_row else None
-        last_calibration_raw = baseline_row.get("Data Ultima Calibragem") if baseline_row else ""
-        last_calibration_at = parse_calibration_date(str(last_calibration_raw or ""))
-
-        baseline_expired = True
-        if last_calibration_at is not None:
-            baseline_expired = (datetime.now() - last_calibration_at) > timedelta(days=30)
-
-        if (
-            baseline_row is None
-            or baseline_expired
-            or price_min is None
-            or price_max is None
-            or price_max <= price_min
-        ):
-            logger.info(
-                "Baseline %s ausente/expirado/inválido para '%s'. Recalibrando.",
-                marketplace,
-                search_keyword,
-            )
-            baseline = calibrate_market_baseline(
-                scraper=scraper,
-                config=config,
-                baseline_ws=baseline_ws,
-                search_keyword=search_keyword,
-                marketplace=marketplace,
-            )
-            if not baseline:
-                return None
-            return {
-                "min": float(baseline["min"]),
-                "max": float(baseline["max"]),
-                "median": float(baseline["median"]),
-            }
-
-        baseline_median_candidates = []
-        if price_min > 0:
-            baseline_median_candidates.append(price_min / 0.50)
-        if price_max > 0:
-            baseline_median_candidates.append(price_max / 1.10)
-
-        if not baseline_median_candidates:
-            logger.warning(
-                "Não foi possível inferir mediana para '%s' [%s]. Recalibrando.",
-                search_keyword,
-                marketplace,
-            )
-            baseline = calibrate_market_baseline(
-                scraper=scraper,
-                config=config,
-                baseline_ws=baseline_ws,
-                search_keyword=search_keyword,
-                marketplace=marketplace,
-            )
-            if not baseline:
-                return None
-            return {
-                "min": float(baseline["min"]),
-                "max": float(baseline["max"]),
-                "median": float(baseline["median"]),
-            }
-
-        return {
-            "min": float(price_min),
-            "max": float(price_max),
-            "median": float(sum(baseline_median_candidates) / len(baseline_median_candidates)),
-        }
-
-    marketplace_baselines: Dict[str, Dict[str, float]] = {}
-    for marketplace in scraper.SITE_CONFIG.keys():
-        resolved = resolve_marketplace_baseline(marketplace)
-        if not resolved:
-            logger.warning("Sem baseline válido para '%s' [%s].", search_keyword, marketplace)
-            continue
-        marketplace_baselines[marketplace] = resolved
-
-    if not marketplace_baselines:
-        logger.warning("Nenhum baseline por marketplace disponível para '%s'.", search_keyword)
+    _, baseline_row = get_baseline_for_keyword(baseline_ws, search_keyword, "global", chat_id="GLOBAL")
+    if not baseline_row:
+        logger.warning("Baseline GLOBAL ausente para '%s'. Aguardando calibragem inicial.", search_keyword)
         return False
 
-    logger.info("Monitoramento '%s' com baseline calibrado por loja.", search_keyword)
+    price_min = safe_float(baseline_row.get("Preco Minimo"))
+    price_max = safe_float(baseline_row.get("Preco Maximo"))
+    baseline_median = safe_float(baseline_row.get("Mediana"))
+
+    if baseline_median is None:
+        baseline_median_candidates = []
+        if price_min is not None and price_min > 0:
+            baseline_median_candidates.append(price_min / 0.50)
+        if price_max is not None and price_max > 0:
+            baseline_median_candidates.append(price_max / 1.10)
+        if baseline_median_candidates:
+            baseline_median = float(sum(baseline_median_candidates) / len(baseline_median_candidates))
+
+    if (
+        price_min is None
+        or price_max is None
+        or baseline_median is None
+        or price_max <= price_min
+        or baseline_median <= 0
+    ):
+        logger.warning(
+            "Baseline GLOBAL inválido para '%s'. Sem recalibração automática.",
+            search_keyword,
+        )
+        return False
+
+    marketplace_baselines: Dict[str, Dict[str, float]] = {
+        marketplace: {
+            "min": float(price_min),
+            "max": float(price_max),
+            "median": float(baseline_median),
+        }
+        for marketplace in scraper.SITE_CONFIG.keys()
+    }
+
+    logger.info("Monitoramento '%s' usando baseline GLOBAL compartilhado entre lojas.", search_keyword)
     discount_steps = [0.50, 0.40, 0.30, 0.20, 0.10]
 
     global_pool: List[Dict[str, Any]] = []
@@ -2606,49 +2570,7 @@ def daily_monitor(
             )
 
     if not global_pool:
-        logger.warning(
-            "Sem resultados válidos após relaxação progressiva GLOBAL para '%s'. Recalibrando de forma definitiva.",
-            search_keyword,
-        )
-
-        marketplace_baselines = {}
-        for marketplace in scraper.SITE_CONFIG.keys():
-            baseline = calibrate_market_baseline(
-                scraper=scraper,
-                config=config,
-                baseline_ws=baseline_ws,
-                search_keyword=search_keyword,
-                marketplace=marketplace,
-            )
-            if not baseline:
-                continue
-            marketplace_baselines[marketplace] = {
-                "min": float(baseline["min"]),
-                "max": float(baseline["max"]),
-                "median": float(baseline["median"]),
-            }
-
-        if not marketplace_baselines:
-            return False
-
-        fetch_result = asyncio.run(
-            fetch_all_marketplaces(
-                scraper=scraper,
-                config=config,
-                product_name=search_keyword,
-                discount_step=discount_steps[0],
-                marketplace_baselines=marketplace_baselines,
-                item_blacklist_terms=item_blacklist_terms,
-                alert_chat_id=alert_chat_id,
-                execution_id=execution_id,
-            )
-        )
-        global_pool = fetch_result.get("global_pool", []) if isinstance(fetch_result, dict) else []
-        log_rows = fetch_result.get("log_rows", []) if isinstance(fetch_result, dict) else []
-        append_scraper_logs(scraper_log_ws, log_rows)
-
-    if not global_pool:
-        logger.warning("Mesmo após recalibragem GLOBAL, sem resultados válidos para '%s'.", search_keyword)
+        logger.warning("Sem resultados válidos para '%s' com o baseline GLOBAL atual.", search_keyword)
         return False
 
     global_df = pd.DataFrame(global_pool)
@@ -2783,6 +2705,7 @@ def main() -> int:
             _, baseline_row = get_baseline_for_keyword(baseline_ws, keyword, "global", chat_id="GLOBAL")
             baseline_min = safe_float(baseline_row.get("Preco Minimo")) if baseline_row else None
             baseline_max = safe_float(baseline_row.get("Preco Maximo")) if baseline_row else None
+            baseline_median = safe_float(baseline_row.get("Mediana")) if baseline_row else None
 
             baseline_median_candidates: List[float] = []
             if baseline_min is not None and baseline_min > 0:
@@ -2791,9 +2714,13 @@ def main() -> int:
                 baseline_median_candidates.append(baseline_max / 1.10)
 
             current_median = (
-                sum(baseline_median_candidates) / len(baseline_median_candidates)
-                if baseline_median_candidates
-                else None
+                baseline_median
+                if baseline_median is not None and baseline_median > 0
+                else (
+                    sum(baseline_median_candidates) / len(baseline_median_candidates)
+                    if baseline_median_candidates
+                    else None
+                )
             )
 
             # Fase 1: Auto-calibragem para itens novos (mediana ausente/zero em Baselines).
@@ -2831,6 +2758,7 @@ def main() -> int:
                     price_max=median_global * 1.10,
                     calibration_timestamp=now_brt_str(),
                     chat_id="GLOBAL",
+                    median=median_global,
                 )
 
                 logger.info("Produto '%s' calibrado com sucesso. Mediana global fixada em R$ %.2f.", keyword, median_global)
@@ -2838,15 +2766,6 @@ def main() -> int:
                 continue
 
             # Fase 2: Monitoramento para itens já calibrados (mediana > 0).
-            upsert_market_baseline(
-                baseline_ws=baseline_ws,
-                search_keyword=keyword,
-                marketplace="global",
-                price_min=current_median * 0.50,
-                price_max=current_median * 1.10,
-                calibration_timestamp=now_brt_str(),
-                chat_id="GLOBAL",
-            )
 
             logger.info("Iniciando busca global para termo: %s", keyword)
             processed = daily_monitor(
