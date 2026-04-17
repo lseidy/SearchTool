@@ -2762,8 +2762,7 @@ def main() -> int:
                 )
 
                 logger.info("Produto '%s' calibrado com sucesso. Mediana global fixada em R$ %.2f.", keyword, median_global)
-                processed_any_term = True
-                continue
+                current_median = median_global
 
             # Fase 2: Monitoramento para itens já calibrados (mediana > 0).
 
