@@ -148,13 +148,25 @@ def _round_price_bounds(preco_min: Optional[float], preco_max: Optional[float]) 
     return min_int, max_int
 
 
+def _is_monitoring_mode(preco_min: Optional[float], preco_max: Optional[float]) -> bool:
+    if preco_min is None or preco_max is None:
+        return False
+    return float(preco_min) > 0 and float(preco_max) > 0
+
+
 def _build_amazon_search_url(termo_busca: str, preco_min: Optional[float], preco_max: Optional[float]) -> str:
     termo_formatado = quote_plus((termo_busca or "").strip())
+    base_url = f"https://www.amazon.com.br/s?k={termo_formatado}"
+
+    if not _is_monitoring_mode(preco_min, preco_max):
+        # Calibragem: sem range e sem ordenação por menor preço.
+        return base_url
+
     min_int, max_int = _round_price_bounds(preco_min, preco_max)
     min_centavos = min_int * 100
     max_centavos = max_int * 100
     return (
-        f"https://www.amazon.com.br/s?k={termo_formatado}"
+        f"{base_url}"
         f"&rh=p_36%3A{min_centavos}-{max_centavos}"
         "&s=price-asc-rank"
     )
@@ -163,20 +175,32 @@ def _build_amazon_search_url(termo_busca: str, preco_min: Optional[float], preco
 def _build_mercadolivre_search_url(termo_busca: str, preco_min: Optional[float], preco_max: Optional[float]) -> str:
     termo_path = re.sub(r"\s+", "-", (termo_busca or "").strip())
     termo_formatado = quote_plus(termo_path).replace("+", "-")
+    base_url = f"https://lista.mercadolivre.com.br/{termo_formatado}"
+
+    if not _is_monitoring_mode(preco_min, preco_max):
+        # Calibragem: sem range e sem ordenação por menor preço.
+        return base_url
+
     min_int, max_int = _round_price_bounds(preco_min, preco_max)
     return (
-        f"https://lista.mercadolivre.com.br/{termo_formatado}"
+        f"{base_url}"
         f"_OrderId_PRICE_PriceRange_{min_int}-{max_int}_NoIndex_True"
     )
 
 
 def _build_magalu_search_url(termo_busca: str, preco_min: Optional[float], preco_max: Optional[float]) -> str:
     termo_formatado = quote_plus((termo_busca or "").strip())
+    base_url = f"https://www.magazineluiza.com.br/busca/{termo_formatado}/"
+
+    if not _is_monitoring_mode(preco_min, preco_max):
+        # Calibragem: sem range e sem ordenação por menor preço.
+        return base_url
+
     min_int, max_int = _round_price_bounds(preco_min, preco_max)
     min_centavos = min_int * 100
     max_centavos = max_int * 100
     return (
-        f"https://www.magazineluiza.com.br/busca/{termo_formatado}/"
+        f"{base_url}"
         f"?filters=price---{min_centavos}:{max_centavos}"
         "&sortOrientation=asc&sortType=price"
     )
