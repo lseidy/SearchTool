@@ -9,7 +9,7 @@ import sys
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 import gspread
 import pandas as pd
