@@ -142,11 +142,69 @@ class AppConfig:
     telegram_enabled: bool
 
 
+def _round_price_bounds(preco_min: Optional[float], preco_max: Optional[float]) -> tuple[int, int]:
+    min_int = max(0, int(round(preco_min if preco_min is not None else 0)))
+    max_int = max(min_int, int(round(preco_max if preco_max is not None else min_int)))
+    return min_int, max_int
+
+
+def _build_amazon_search_url(termo_busca: str, preco_min: Optional[float], preco_max: Optional[float]) -> str:
+    termo_formatado = quote_plus((termo_busca or "").strip())
+    min_int, max_int = _round_price_bounds(preco_min, preco_max)
+    min_centavos = min_int * 100
+    max_centavos = max_int * 100
+    return (
+        f"https://www.amazon.com.br/s?k={termo_formatado}"
+        f"&rh=p_36%3A{min_centavos}-{max_centavos}"
+        "&s=price-asc-rank"
+    )
+
+
+def _build_mercadolivre_search_url(termo_busca: str, preco_min: Optional[float], preco_max: Optional[float]) -> str:
+    termo_path = re.sub(r"\s+", "-", (termo_busca or "").strip())
+    termo_formatado = quote_plus(termo_path).replace("+", "-")
+    min_int, max_int = _round_price_bounds(preco_min, preco_max)
+    return (
+        f"https://lista.mercadolivre.com.br/{termo_formatado}"
+        f"_OrderId_PRICE_PriceRange_{min_int}-{max_int}_NoIndex_True"
+    )
+
+
+def _build_magalu_search_url(termo_busca: str, preco_min: Optional[float], preco_max: Optional[float]) -> str:
+    termo_formatado = quote_plus((termo_busca or "").strip())
+    min_int, max_int = _round_price_bounds(preco_min, preco_max)
+    min_centavos = min_int * 100
+    max_centavos = max_int * 100
+    return (
+        f"https://www.magazineluiza.com.br/busca/{termo_formatado}/"
+        f"?filters=price---{min_centavos}:{max_centavos}"
+        "&sortOrientation=asc&sortType=price"
+    )
+
+
+def _build_shopee_search_url(termo_busca: str, preco_min: Optional[float], preco_max: Optional[float]) -> str:
+    termo_formatado = quote_plus((termo_busca or "").strip())
+    min_int, max_int = _round_price_bounds(preco_min, preco_max)
+    filter_payload = [
+        {
+            "group_name": "PRICE_RANGE",
+            "values": [f"{min_int}▶◀{max_int}"],
+        }
+    ]
+    filters = quote_plus(json.dumps(filter_payload, ensure_ascii=False))
+    return (
+        f"https://shopee.com.br/search?keyword={termo_formatado}"
+        "&sortBy=price&order=asc"
+        f"&fe_filter_options={filters}"
+    )
+
+
 class MultiMarketplaceScraper:
     SITE_CONFIG: Dict[str, Dict[str, Any]] = {
         "mercadolivre": {
             "base_url": "https://lista.mercadolivre.com.br/{query}",
             "sort_lowest": "_OrderId_PRICE",
+            "url_builder": _build_mercadolivre_search_url,
             "range_mode": "path_reais",
             "selectors": {
                 "cards": "li.ui-search-layout__item, div.poly-card",
@@ -160,6 +218,7 @@ class MultiMarketplaceScraper:
         "amazon": {
             "base_url": "https://www.amazon.com.br/s?k={query}",
             "sort_lowest": "s=price-asc-rank",
+            "url_builder": _build_amazon_search_url,
             "range_mode": "query_cents",
             "range_param": "rh=p_36:{min}-{max}",
             "range_param_min_only": "rh=p_36:{min}-",
@@ -176,6 +235,7 @@ class MultiMarketplaceScraper:
         "shopee": {
             "base_url": "https://shopee.com.br/search?keyword={query}",
             "sort_lowest": "sortBy=price&order=asc",
+            "url_builder": _build_shopee_search_url,
             "range_mode": "query_shopee_filter",
             "selectors": {
                 "cards": "div.shopee-search-item-result__item, div[data-sqe='item']",
@@ -189,6 +249,7 @@ class MultiMarketplaceScraper:
         "magalu": {
             "base_url": "https://www.magazineluiza.com.br/busca/{query}/",
             "sort_lowest": "sortOrientation=asc&sortType=price",
+            "url_builder": _build_magalu_search_url,
             "range_mode": "query_magalu_filter",
             "selectors": {
                 "cards": "[data-testid='product-card-content'], [data-testid='product-card-container']",
@@ -221,77 +282,12 @@ class MultiMarketplaceScraper:
     ) -> str:
         site_key = self.normalize_marketplace(marketplace)
         site = self.SITE_CONFIG[site_key]
+        builder = site.get("url_builder")
+        if callable(builder):
+            return builder(keyword, price_min, price_max)
+
         query = quote_plus(keyword)
-        url = site["base_url"].format(query=query)
-
-        if site_key == "mercadolivre":
-            offset_part = f"_Desde_{start_offset}" if start_offset > 1 else ""
-            sort_part = site["sort_lowest"] if sort_by_price else ""
-            range_part = ""
-            if price_min is not None and price_max is not None:
-                min_int = max(0, int(round(price_min)))
-                max_int = max(min_int, int(round(price_max)))
-                range_part = f"_PriceRange_{min_int}BRL-{max_int}BRL"
-            return f"{url}{offset_part}{sort_part}{range_part}{build_marketplace_filters_suffix()}"
-
-        query_params: List[str] = []
-        if sort_by_price and site.get("sort_lowest"):
-            query_params.append(site["sort_lowest"])
-
-        if price_min is not None or price_max is not None:
-            min_bound = max(0.0, float(price_min)) if price_min is not None else None
-            max_bound = max(0.0, float(price_max)) if price_max is not None else None
-
-            if min_bound is not None and max_bound is not None and max_bound < min_bound:
-                max_bound = min_bound
-
-            min_value = int(round(min_bound)) if min_bound is not None else 0
-            max_value = int(round(max_bound)) if max_bound is not None else min_value
-
-            if site.get("range_mode") == "query_cents":
-                min_cents = int(round(min_bound * 100)) if min_bound is not None else None
-                max_cents = int(round(max_bound * 100)) if max_bound is not None else None
-
-                if min_cents is not None and max_cents is not None:
-                    range_template = site.get("range_param", "")
-                    range_param = range_template.format(min=min_cents, max=max_cents)
-                elif min_cents is not None:
-                    range_template = site.get("range_param_min_only", "rh=p_36:{min}-")
-                    range_param = range_template.format(min=min_cents)
-                elif max_cents is not None:
-                    range_template = site.get("range_param_max_only", "rh=p_36:-{max}")
-                    range_param = range_template.format(max=max_cents)
-                else:
-                    range_param = ""
-
-                if range_param:
-                    query_params.append(range_param)
-
-            elif site.get("range_mode") == "query_shopee_filter":
-                # Ex.: fe_filter_options=[{"group_name":"PRICE_RANGE","values":["30▶◀150"]}]
-                shopee_min = min_value if min_bound is not None else 0
-                shopee_max = max_value if max_bound is not None else 999999
-                filter_payload = [
-                    {
-                        "group_name": "PRICE_RANGE",
-                        "values": [f"{shopee_min}▶◀{shopee_max}"],
-                    }
-                ]
-                query_params.append(f"fe_filter_options={quote_plus(json.dumps(filter_payload, ensure_ascii=False))}")
-
-            elif site.get("range_mode") == "query_magalu_filter":
-                # Magalu usa centavos inteiros (ex.: 6118 => R$ 61,18), então preservamos casas decimais.
-                min_cents = int(round(min_bound * 100)) if min_bound is not None else 0
-                max_cents = int(round(max_bound * 100)) if max_bound is not None else 999999999
-                if max_cents < min_cents:
-                    max_cents = min_cents
-                query_params.append(f"filters=price---{min_cents}:{max_cents}")
-
-        if not query_params:
-            return url
-
-        joiner = "&" if "?" in url else "?"
-        return f"{url}{joiner}{'&'.join(query_params)}"
+        return site["base_url"].format(query=query)
 
     def extract_price_from_card(self, card, selectors: Dict[str, str]) -> Optional[float]:
         whole_selector = selectors.get("price_whole", "")
@@ -770,7 +766,10 @@ def contains_item_blacklist_keyword(title: str, blacklist_terms: List[str]) -> b
 
     normalized_title = normalize_text(title)
     for term in blacklist_terms:
-        if term and term in normalized_title:
+        normalized_term = normalize_text(term).strip().lower()
+        if not normalized_term:
+            continue
+        if re.search(rf"\b{re.escape(normalized_term)}\b", normalized_title):
             return True
     return False
 
@@ -2233,12 +2232,15 @@ def collect_monitor_products_with_quota(
             start_offset,
         )
 
+        piso = int(round(price_min))
+        teto = int(round(price_max))
+
         page_products = scraper.get_products(
             marketplace=marketplace,
             keyword=search_keyword,
             limit=quota,
-            price_min=price_min,
-            price_max=price_max,
+            price_min=piso,
+            price_max=teto,
             sort_by_price=True,
             start_offset=start_offset,
         )
