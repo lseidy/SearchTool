@@ -336,6 +336,13 @@ class MultiMarketplaceScraper:
                 fraction_text = (fraction_el.inner_text() or "").strip()
 
         if whole_text:
+            # Alguns marketplaces (ex.: Magalu) já trazem o preço completo em um único campo
+            # (ex.: "R$ 65,01"). Nesses casos, parsear direto evita transformar em 6501.
+            if not fraction_selector:
+                parsed_whole = parse_price_to_float(whole_text)
+                if parsed_whole is not None:
+                    return parsed_whole
+
             whole_digits = re.sub(r"\D", "", whole_text)
             fraction_digits = re.sub(r"\D", "", fraction_text)
 
