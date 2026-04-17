@@ -525,22 +525,52 @@ def load_config() -> AppConfig:
 
 def parse_price_to_float(price_text: str) -> Optional[float]:
     if not price_text:
+        logger.debug("Preco extraido: vazio -> Convertido: None")
         return None
 
-    cleaned = price_text.strip()
-    cleaned = cleaned.replace("R$", "")
-    cleaned = cleaned.replace("\u00a0", "")
+    raw_text = str(price_text)
+    cleaned = raw_text.strip().replace("R$", "").replace("\u00a0", "")
+    cleaned = re.sub(r"\s+", "", cleaned)
     cleaned = re.sub(r"[^\d,\.]", "", cleaned)
 
     if not cleaned:
+        logger.debug("Preco extraido: %s -> Convertido: None (sem digitos)", raw_text)
         return None
 
-    if "," in cleaned:
-        cleaned = cleaned.replace(".", "").replace(",", ".")
+    normalized = cleaned
+    has_comma = "," in normalized
+    has_dot = "." in normalized
+
+    if has_comma and has_dot:
+        # Usa o ultimo separador como decimal para lidar com formatos mistos.
+        if normalized.rfind(",") > normalized.rfind("."):
+            normalized = normalized.replace(".", "").replace(",", ".")
+        else:
+            normalized = normalized.replace(",", "")
+    elif has_comma:
+        if re.search(r",\d{1,2}$", normalized):
+            normalized = normalized.replace(".", "").replace(",", ".")
+        else:
+            normalized = normalized.replace(",", "")
+    elif has_dot:
+        if re.search(r"\.\d{1,2}$", normalized):
+            normalized = normalized.replace(",", "")
+        else:
+            normalized = normalized.replace(".", "")
+
+    if normalized.isdigit() and len(normalized) >= 5:
+        as_int = int(normalized)
+        # Alguns cards retornam centavos embutidos sem separador (ex.: 458247 => 4582.47).
+        should_shift_cents = as_int >= 100000 or (as_int >= 10000 and as_int % 100 != 0)
+        if should_shift_cents:
+            normalized = f"{as_int / 100:.2f}"
 
     try:
-        return float(cleaned)
+        value = float(normalized)
+        logger.debug("Preco extraido: %s -> Convertido: %.2f", raw_text, value)
+        return value
     except ValueError:
+        logger.debug("Preco extraido: %s -> Convertido: None (normalizado=%s)", raw_text, normalized)
         return None
 
 
@@ -2025,12 +2055,29 @@ def collect_monitor_products_with_quota(
             sort_by_price=True,
             start_offset=start_offset,
         )
-        page_valid = filter_valid_products(
+
+        page_valid_strict = filter_valid_products(
             products=page_products,
             search_keyword=search_keyword,
             min_price_threshold=config.min_price_threshold,
         )
-        page_valid = filter_products_by_price_range(page_valid, price_min, price_max)
+
+        page_valid = filter_products_by_price_range(page_valid_strict, price_min, price_max)
+
+        if not page_valid and page_products:
+            # Fallback controlado: mantém itens válidos por URL/preço/faixa quando a validação de título elimina tudo.
+            relaxed_base = sanitize_products(page_products)
+            relaxed_base = [p for p in relaxed_base if p.price >= config.min_price_threshold]
+            relaxed_valid = filter_products_by_price_range(relaxed_base, price_min, price_max)
+
+            if relaxed_valid:
+                logger.warning(
+                    "Monitoramento '%s' [%s] | fallback semântico ativado: estrito=0, relaxado=%d",
+                    search_keyword,
+                    marketplace,
+                    len(relaxed_valid),
+                )
+                page_valid = relaxed_valid
 
         for product in page_valid:
             norm_url = normalize_url(product.url)
@@ -2079,23 +2126,47 @@ async def fetch_all_marketplaces(
             logger.warning("Falha na busca %s para '%s': %s", marketplace, product_name, result)
             continue
 
+        if not isinstance(result, list):
+            logger.warning("Coleta GLOBAL '%s' | loja=%s retornou tipo inesperado: %s", product_name, marketplace, type(result).__name__)
+            continue
+
+        store_items: List[Dict[str, Any]] = []
+        for product in result:
+            price_value = safe_float(getattr(product, "price", None))
+            title_value = str(getattr(product, "name", "") or "").strip()
+            url_value = str(getattr(product, "url", "") or "").strip()
+            image_value = getattr(product, "image_url", None)
+
+            if price_value is None:
+                logger.debug("Coleta GLOBAL '%s' | loja=%s descartou item sem preco valido: title=%s raw_price=%s", product_name, marketplace, title_value, getattr(product, "price", None))
+                continue
+            if not title_value or not url_value:
+                logger.debug("Coleta GLOBAL '%s' | loja=%s descartou item incompleto: title=%s url=%s", product_name, marketplace, title_value, url_value)
+                continue
+
+            store_items.append(
+                {
+                    "store": marketplace,
+                    "title": title_value,
+                    "price": float(price_value),
+                    "url": url_value,
+                    "image_url": image_value,
+                }
+            )
+
         logger.info(
-            "Coleta GLOBAL '%s' | loja=%s | urls/produtos validos encontrados: %d",
+            "Coleta GLOBAL '%s' | loja=%s | produtos recebidos: %d | produtos consolidados: %d | piso=%.2f teto=%.2f",
             product_name,
             marketplace,
             len(result),
+            len(store_items),
+            dynamic_floor,
+            price_cap,
         )
 
-        for product in result:
-            global_pool.append(
-                {
-                    "store": marketplace,
-                    "title": product.name,
-                    "price": product.price,
-                    "url": product.url,
-                    "image_url": product.image_url,
-                }
-            )
+        global_pool.extend(store_items)
+
+    logger.info("Coleta GLOBAL '%s' | total consolidado no pool: %d", product_name, len(global_pool))
 
     return global_pool
 
