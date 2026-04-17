@@ -502,7 +502,7 @@ def load_config() -> AppConfig:
     telegram_token = os.getenv("TELEGRAM_TOKEN", "").strip()
     telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-    telegram_enabled = bool(telegram_token and telegram_chat_id)
+    telegram_enabled = bool(telegram_token)
 
     if not google_sheet_id:
         raise ValueError("Defina a variável de ambiente GOOGLE_SHEET_ID.")
@@ -1549,6 +1549,7 @@ def send_telegram_message(token: str, chat_id: str, message: str) -> None:
 
 
 def enviar_alerta_telegram(
+    chat_id: str,
     produto: str,
     preco: float,
     mediana: float,
@@ -1557,7 +1558,6 @@ def enviar_alerta_telegram(
     image_url: Optional[str],
 ) -> None:
     token = os.getenv("TELEGRAM_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         logger.info("Telegram não configurado. Alerta ignorado.")
         return
@@ -1660,6 +1660,7 @@ def ensure_history_headers(data_ws) -> None:
 
 def ensure_target_headers(target_ws) -> None:
     expected_headers = [
+        "Chat_ID",
         "Termo Buscado",
         "Marketplace",
         "Preco Minimo",
@@ -1668,7 +1669,7 @@ def ensure_target_headers(target_ws) -> None:
     ]
     current_headers = target_ws.row_values(1)
     if current_headers != expected_headers:
-        target_ws.update("A1:E1", [expected_headers], value_input_option="USER_ENTERED")
+        target_ws.update("A1:F1", [expected_headers], value_input_option="USER_ENTERED")
 
 
 def get_or_create_worksheet(sh, worksheet_name: str, rows: int = 200, cols: int = 10):
@@ -1679,14 +1680,18 @@ def get_or_create_worksheet(sh, worksheet_name: str, rows: int = 200, cols: int 
         return sh.add_worksheet(title=worksheet_name, rows=rows, cols=cols)
 
 
-def get_baseline_for_keyword(target_ws, search_keyword: str, marketplace: str):
+def get_baseline_for_keyword(target_ws, search_keyword: str, marketplace: str, chat_id: Optional[str] = None):
     rows = target_ws.get_all_records()
     keyword_key = search_keyword.strip().lower()
     marketplace_key = (marketplace or DEFAULT_MARKETPLACE).strip().lower()
+    target_chat_id = str(chat_id or "").strip()
 
     for idx, row in enumerate(rows, start=2):
+        row_chat_id = str(row.get("Chat_ID", "") or "").strip()
         term = str(row.get("Termo Buscado", "") or "").strip().lower()
         row_marketplace = str(row.get("Marketplace", "") or "").strip().lower() or DEFAULT_MARKETPLACE
+        if target_chat_id and row_chat_id != target_chat_id:
+            continue
         if term == keyword_key and row_marketplace == marketplace_key:
             return idx, row
 
@@ -1713,9 +1718,10 @@ def upsert_market_baseline(
     price_min: float,
     price_max: float,
     calibration_timestamp: str,
+    chat_id: str = "GLOBAL",
 ) -> None:
-    row_index, _ = get_baseline_for_keyword(target_ws, search_keyword, marketplace)
-    payload = [search_keyword, marketplace, price_min, price_max, calibration_timestamp]
+    row_index, _ = get_baseline_for_keyword(target_ws, search_keyword, marketplace, chat_id=chat_id)
+    payload = [chat_id, search_keyword, marketplace, price_min, price_max, calibration_timestamp]
 
     if row_index is None:
         target_ws.append_row(payload, value_input_option="USER_ENTERED")
@@ -1723,7 +1729,7 @@ def upsert_market_baseline(
         return
 
     target_ws.update(
-        f"A{row_index}:E{row_index}",
+        f"A{row_index}:F{row_index}",
         [payload],
         value_input_option="USER_ENTERED",
     )
@@ -1865,7 +1871,13 @@ def calibrate_global_market_baseline(
     }
 
 
-def process_products(config: AppConfig, data_ws, products: List[Product], search_keyword: str) -> bool:
+def process_products(
+    config: AppConfig,
+    data_ws,
+    products: List[Product],
+    search_keyword: str,
+    alert_chat_id: Optional[str] = None,
+) -> bool:
     ensure_history_headers(data_ws)
 
     if not products:
@@ -1955,6 +1967,7 @@ def process_products(config: AppConfig, data_ws, products: List[Product], search
             )
             if config.telegram_enabled:
                 enviar_alerta_telegram(
+                    chat_id=str(alert_chat_id or "").strip(),
                     produto=search_keyword,
                     preco=current_price,
                     mediana=median_reference,
@@ -2093,11 +2106,12 @@ def daily_monitor(
     data_ws,
     target_ws,
     search_keyword: str,
+    alert_chat_id: str,
 ) -> bool:
     ensure_target_headers(target_ws)
     ensure_history_headers(data_ws)
 
-    _, baseline_row = get_baseline_for_keyword(target_ws, search_keyword, "global")
+    _, baseline_row = get_baseline_for_keyword(target_ws, search_keyword, "global", chat_id="GLOBAL")
     price_min = safe_float(baseline_row.get("Preco Minimo")) if baseline_row else None
     price_max = safe_float(baseline_row.get("Preco Maximo")) if baseline_row else None
     last_calibration_raw = baseline_row.get("Data Ultima Calibragem") if baseline_row else ""
@@ -2256,6 +2270,7 @@ def daily_monitor(
         data_ws,
         [Product(name=winner_title, price=winner_price, url=winner_url, image_url=winner_image_url)],
         search_keyword,
+        alert_chat_id=alert_chat_id,
     )
 
     if winner_discount >= 0.10:
@@ -2270,6 +2285,7 @@ def daily_monitor(
         )
         if config.telegram_enabled:
             enviar_alerta_telegram(
+                chat_id=str(alert_chat_id or "").strip(),
                 produto=winner_title,
                 preco=winner_price,
                 mediana=global_median,
@@ -2294,6 +2310,7 @@ def get_monitoring_targets(
     scraper: MultiMarketplaceScraper,
     target_ws,
     fallback_keywords: List[str],
+    default_chat_id: str,
 ) -> List[Dict[str, str]]:
     ensure_target_headers(target_ws)
     rows = target_ws.get_all_records()
@@ -2301,21 +2318,25 @@ def get_monitoring_targets(
     seen = set()
 
     for row in rows:
+        chat_id = str(row.get("Chat_ID", "") or "").strip()
         term = str(row.get("Termo Buscado", "") or "").strip()
         if not term:
             continue
 
-        key = term.lower()
+        if not chat_id or chat_id.upper() == "GLOBAL":
+            continue
+
+        key = f"{chat_id}:{term.lower()}"
         if key in seen:
             continue
         seen.add(key)
-        targets.append({"keyword": term})
+        targets.append({"keyword": term, "chat_id": chat_id})
 
     if targets:
         return targets
 
     for keyword in fallback_keywords:
-        targets.append({"keyword": keyword})
+        targets.append({"keyword": keyword, "chat_id": default_chat_id})
 
     return targets
 
@@ -2329,10 +2350,16 @@ def main() -> int:
         target_ws = get_or_create_worksheet(sh, config.target_sheet_name)
 
         processed_any_term = False
-        monitoring_targets = get_monitoring_targets(scraper, target_ws, config.search_keywords)
+        monitoring_targets = get_monitoring_targets(
+            scraper,
+            target_ws,
+            config.search_keywords,
+            default_chat_id=config.telegram_chat_id,
+        )
 
         for target in monitoring_targets:
             keyword = target["keyword"]
+            chat_id = str(target.get("chat_id", "") or "").strip()
             logger.info("Iniciando busca global para termo: %s", keyword)
             processed = daily_monitor(
                 scraper=scraper,
@@ -2340,6 +2367,7 @@ def main() -> int:
                 data_ws=data_ws,
                 target_ws=target_ws,
                 search_keyword=keyword,
+                alert_chat_id=chat_id,
             )
             processed_any_term = processed_any_term or processed
 
