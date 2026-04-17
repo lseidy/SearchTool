@@ -721,6 +721,32 @@ def normalize_text(text: str) -> str:
     return normalized
 
 
+def parse_item_blacklist(raw_blacklist: str) -> List[str]:
+    if not raw_blacklist:
+        return []
+
+    terms: List[str] = []
+    seen = set()
+    for part in re.split(r"[,;\n]+", str(raw_blacklist)):
+        normalized = normalize_text(part)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        terms.append(normalized)
+    return terms
+
+
+def contains_item_blacklist_keyword(title: str, blacklist_terms: List[str]) -> bool:
+    if not blacklist_terms:
+        return False
+
+    normalized_title = normalize_text(title)
+    for term in blacklist_terms:
+        if term and term in normalized_title:
+            return True
+    return False
+
+
 def keyword_tokens(keyword: str) -> List[str]:
     return [token for token in normalize_text(keyword).split() if token]
 
@@ -770,12 +796,21 @@ def filter_valid_products(
     products: List[Product],
     search_keyword: str,
     min_price_threshold: float,
+    item_blacklist_terms: Optional[List[str]] = None,
 ) -> List[Product]:
     base = sanitize_products(products)
     validated: List[Product] = []
+    scoped_blacklist_terms = item_blacklist_terms or []
 
     for product in base:
         if product.price < min_price_threshold:
+            continue
+        if contains_item_blacklist_keyword(product.name, scoped_blacklist_terms):
+            logger.debug(
+                "Produto descartado por blacklist local | termo='%s' | titulo='%s'",
+                search_keyword,
+                product.name,
+            )
             continue
         if not validate_title_match(search_keyword, product.name):
             continue
@@ -1696,10 +1731,11 @@ def ensure_target_headers(target_ws) -> None:
         "Preco Minimo",
         "Preco Maximo",
         "Data Ultima Calibragem",
+        "Blacklist",
     ]
     current_headers = target_ws.row_values(1)
     if current_headers != expected_headers:
-        target_ws.update("A1:F1", [expected_headers], value_input_option="USER_ENTERED")
+        target_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
 
 
 def get_or_create_worksheet(sh, worksheet_name: str, rows: int = 200, cols: int = 10):
@@ -2031,6 +2067,7 @@ def collect_monitor_products_with_quota(
     price_max: float,
     quota: int,
     max_pages: int = 3,
+    item_blacklist_terms: Optional[List[str]] = None,
 ) -> List[Product]:
     collected: List[Product] = []
     seen_urls = set()
@@ -2060,6 +2097,7 @@ def collect_monitor_products_with_quota(
             products=page_products,
             search_keyword=search_keyword,
             min_price_threshold=config.min_price_threshold,
+            item_blacklist_terms=item_blacklist_terms,
         )
 
         page_valid = filter_products_by_price_range(page_valid_strict, price_min, price_max)
@@ -2068,6 +2106,10 @@ def collect_monitor_products_with_quota(
             # Fallback controlado: mantém itens válidos por URL/preço/faixa quando a validação de título elimina tudo.
             relaxed_base = sanitize_products(page_products)
             relaxed_base = [p for p in relaxed_base if p.price >= config.min_price_threshold]
+            if item_blacklist_terms:
+                relaxed_base = [
+                    p for p in relaxed_base if not contains_item_blacklist_keyword(p.name, item_blacklist_terms)
+                ]
             relaxed_valid = filter_products_by_price_range(relaxed_base, price_min, price_max)
 
             if relaxed_valid:
@@ -2099,6 +2141,7 @@ async def fetch_all_marketplaces(
     discount_step: float,
     baseline_median: float,
     price_cap: float,
+    item_blacklist_terms: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     dynamic_floor = max(baseline_median * (1 - discount_step), config.min_price_threshold)
     marketplaces = list(scraper.SITE_CONFIG.keys())
@@ -2114,6 +2157,7 @@ async def fetch_all_marketplaces(
             price_cap,
             config.monitor_top_n,
             3,
+            item_blacklist_terms,
         )
         for marketplace in marketplaces
     ]
@@ -2178,6 +2222,7 @@ def daily_monitor(
     target_ws,
     search_keyword: str,
     alert_chat_id: str,
+    item_blacklist_terms: Optional[List[str]] = None,
 ) -> bool:
     ensure_target_headers(target_ws)
     ensure_history_headers(data_ws)
@@ -2276,6 +2321,7 @@ def daily_monitor(
                 discount_step=step,
                 baseline_median=baseline_median,
                 price_cap=price_max,
+                item_blacklist_terms=item_blacklist_terms,
             )
         )
 
@@ -2312,6 +2358,7 @@ def daily_monitor(
                 discount_step=discount_steps[0],
                 baseline_median=baseline["median"],
                 price_cap=baseline["max"],
+                item_blacklist_terms=item_blacklist_terms,
             )
         )
 
@@ -2391,6 +2438,7 @@ def get_monitoring_targets(
     for row in rows:
         chat_id = str(row.get("Chat_ID", "") or "").strip()
         term = str(row.get("Termo Buscado", "") or "").strip()
+        blacklist = str(row.get("Blacklist", "") or "").strip()
         if not term:
             continue
 
@@ -2401,13 +2449,13 @@ def get_monitoring_targets(
         if key in seen:
             continue
         seen.add(key)
-        targets.append({"keyword": term, "chat_id": chat_id})
+        targets.append({"keyword": term, "chat_id": chat_id, "blacklist": blacklist})
 
     if targets:
         return targets
 
     for keyword in fallback_keywords:
-        targets.append({"keyword": keyword, "chat_id": default_chat_id})
+        targets.append({"keyword": keyword, "chat_id": default_chat_id, "blacklist": ""})
 
     return targets
 
@@ -2431,6 +2479,7 @@ def main() -> int:
         for target in monitoring_targets:
             keyword = target["keyword"]
             chat_id = str(target.get("chat_id", "") or "").strip()
+            scoped_blacklist_terms = parse_item_blacklist(str(target.get("blacklist", "") or ""))
             logger.info("Iniciando busca global para termo: %s", keyword)
             processed = daily_monitor(
                 scraper=scraper,
@@ -2439,6 +2488,7 @@ def main() -> int:
                 target_ws=target_ws,
                 search_keyword=keyword,
                 alert_chat_id=chat_id,
+                item_blacklist_terms=scoped_blacklist_terms,
             )
             processed_any_term = processed_any_term or processed
 
