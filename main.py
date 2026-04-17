@@ -136,6 +136,7 @@ class AppConfig:
     google_sheet_id: str
     data_sheet_name: str
     target_sheet_name: str
+    scraper_log_sheet_name: str
     telegram_token: str
     telegram_chat_id: str
     telegram_enabled: bool
@@ -543,6 +544,7 @@ def load_config() -> AppConfig:
         google_sheet_id=google_sheet_id,
         data_sheet_name=os.getenv("DATA_SHEET_NAME", "Historico").strip(),
         target_sheet_name=os.getenv("TARGET_SHEET_NAME", "PrecosAlvo").strip(),
+        scraper_log_sheet_name=os.getenv("SCRAPER_LOG_SHEET_NAME", "LogScraper").strip() or "LogScraper",
         telegram_token=telegram_token,
         telegram_chat_id=telegram_chat_id,
         telegram_enabled=telegram_enabled,
@@ -1854,6 +1856,34 @@ def ensure_baseline_headers(baseline_ws) -> None:
         baseline_ws.update("A1:F1", [expected_headers], value_input_option="USER_ENTERED")
 
 
+def ensure_scraper_log_headers(log_ws) -> None:
+    expected_headers = [
+        "Data/Hora",
+        "Execucao_ID",
+        "Chat_ID",
+        "Termo Buscado",
+        "Marketplace",
+        "Pagina",
+        "Titulo",
+        "Preco",
+        "URL",
+        "Imagem",
+        "Passou_Filtro_Estrito",
+        "Passou_Filtro_Final",
+    ]
+    current_headers = log_ws.row_values(1)
+    if current_headers != expected_headers:
+        log_ws.update("A1:L1", [expected_headers], value_input_option="USER_ENTERED")
+
+
+def append_scraper_logs(log_ws, rows: List[List[Any]]) -> None:
+    if not rows:
+        return
+
+    ensure_scraper_log_headers(log_ws)
+    log_ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+
 def get_or_create_worksheet(sh, worksheet_name: str, rows: int = 200, cols: int = 10):
     try:
         return sh.worksheet(worksheet_name)
@@ -2185,9 +2215,12 @@ def collect_monitor_products_with_quota(
     quota: int,
     max_pages: int = 3,
     item_blacklist_terms: Optional[List[str]] = None,
-) -> List[Product]:
+    alert_chat_id: str = "",
+    execution_id: str = "",
+) -> Dict[str, Any]:
     collected: List[Product] = []
     seen_urls = set()
+    log_rows: List[List[Any]] = []
 
     for page_number in range(1, max_pages + 1):
         start_offset = 1 + (page_number - 1) * 48
@@ -2239,6 +2272,28 @@ def collect_monitor_products_with_quota(
                 )
                 page_valid = relaxed_valid
 
+        strict_urls = {normalize_url(product.url) for product in page_valid_strict if product.url}
+        final_urls = {normalize_url(product.url) for product in page_valid if product.url}
+
+        for product in page_products:
+            norm_url = normalize_url(product.url)
+            log_rows.append(
+                [
+                    now_brt_str(),
+                    execution_id,
+                    str(alert_chat_id or "").strip(),
+                    search_keyword,
+                    marketplace,
+                    page_number,
+                    product.name,
+                    float(product.price),
+                    norm_url,
+                    product.image_url or "",
+                    "sim" if norm_url in strict_urls else "nao",
+                    "sim" if norm_url in final_urls else "nao",
+                ]
+            )
+
         for product in page_valid:
             norm_url = normalize_url(product.url)
             if not norm_url or norm_url in seen_urls:
@@ -2247,9 +2302,9 @@ def collect_monitor_products_with_quota(
             collected.append(product)
 
             if len(collected) >= quota:
-                return collected
+                return {"products": collected, "log_rows": log_rows}
 
-    return collected
+    return {"products": collected, "log_rows": log_rows}
 
 
 async def fetch_all_marketplaces(
@@ -2260,7 +2315,9 @@ async def fetch_all_marketplaces(
     baseline_median: float,
     price_cap: float,
     item_blacklist_terms: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
+    alert_chat_id: str = "",
+    execution_id: str = "",
+) -> Dict[str, Any]:
     dynamic_floor = max(baseline_median * (1 - discount_step), config.min_price_threshold)
     marketplaces = list(scraper.SITE_CONFIG.keys())
 
@@ -2276,24 +2333,36 @@ async def fetch_all_marketplaces(
             config.monitor_top_n,
             3,
             item_blacklist_terms,
+            alert_chat_id,
+            execution_id,
         )
         for marketplace in marketplaces
     ]
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     global_pool: List[Dict[str, Any]] = []
+    all_log_rows: List[List[Any]] = []
 
     for marketplace, result in zip(marketplaces, results):
         if isinstance(result, Exception):
             logger.warning("Falha na busca %s para '%s': %s", marketplace, product_name, result)
             continue
 
-        if not isinstance(result, list):
+        if not isinstance(result, dict):
             logger.warning("Coleta GLOBAL '%s' | loja=%s retornou tipo inesperado: %s", product_name, marketplace, type(result).__name__)
             continue
 
+        result_products = result.get("products", [])
+        result_logs = result.get("log_rows", [])
+        if isinstance(result_logs, list):
+            all_log_rows.extend(result_logs)
+
+        if not isinstance(result_products, list):
+            logger.warning("Coleta GLOBAL '%s' | loja=%s retornou lista de produtos inválida: %s", product_name, marketplace, type(result_products).__name__)
+            continue
+
         store_items: List[Dict[str, Any]] = []
-        for product in result:
+        for product in result_products:
             price_value = safe_float(getattr(product, "price", None))
             title_value = str(getattr(product, "name", "") or "").strip()
             url_value = str(getattr(product, "url", "") or "").strip()
@@ -2320,7 +2389,7 @@ async def fetch_all_marketplaces(
             "Coleta GLOBAL '%s' | loja=%s | produtos recebidos: %d | produtos consolidados: %d | piso=%.2f teto=%.2f",
             product_name,
             marketplace,
-            len(result),
+            len(result_products),
             len(store_items),
             dynamic_floor,
             price_cap,
@@ -2330,7 +2399,7 @@ async def fetch_all_marketplaces(
 
     logger.info("Coleta GLOBAL '%s' | total consolidado no pool: %d", product_name, len(global_pool))
 
-    return global_pool
+    return {"global_pool": global_pool, "log_rows": all_log_rows}
 
 
 def daily_monitor(
@@ -2338,9 +2407,11 @@ def daily_monitor(
     config: AppConfig,
     data_ws,
     baseline_ws,
+    scraper_log_ws,
     search_keyword: str,
     alert_chat_id: str,
     item_blacklist_terms: Optional[List[str]] = None,
+    execution_id: str = "",
 ) -> bool:
     ensure_baseline_headers(baseline_ws)
     ensure_history_headers(data_ws)
@@ -2431,7 +2502,7 @@ def daily_monitor(
             price_max,
         )
 
-        global_pool = asyncio.run(
+        fetch_result = asyncio.run(
             fetch_all_marketplaces(
                 scraper=scraper,
                 config=config,
@@ -2440,8 +2511,13 @@ def daily_monitor(
                 baseline_median=baseline_median,
                 price_cap=price_max,
                 item_blacklist_terms=item_blacklist_terms,
+                alert_chat_id=alert_chat_id,
+                execution_id=execution_id,
             )
         )
+        global_pool = fetch_result.get("global_pool", []) if isinstance(fetch_result, dict) else []
+        log_rows = fetch_result.get("log_rows", []) if isinstance(fetch_result, dict) else []
+        append_scraper_logs(scraper_log_ws, log_rows)
 
         if global_pool:
             break
@@ -2468,7 +2544,7 @@ def daily_monitor(
         if not baseline:
             return False
 
-        global_pool = asyncio.run(
+        fetch_result = asyncio.run(
             fetch_all_marketplaces(
                 scraper=scraper,
                 config=config,
@@ -2477,8 +2553,13 @@ def daily_monitor(
                 baseline_median=baseline["median"],
                 price_cap=baseline["max"],
                 item_blacklist_terms=item_blacklist_terms,
+                alert_chat_id=alert_chat_id,
+                execution_id=execution_id,
             )
         )
+        global_pool = fetch_result.get("global_pool", []) if isinstance(fetch_result, dict) else []
+        log_rows = fetch_result.get("log_rows", []) if isinstance(fetch_result, dict) else []
+        append_scraper_logs(scraper_log_ws, log_rows)
 
     if not global_pool:
         logger.warning("Mesmo após recalibragem GLOBAL, sem resultados válidos para '%s'.", search_keyword)
@@ -2582,6 +2663,9 @@ def main() -> int:
             sh,
             os.getenv("BASELINE_SHEET_NAME", "Baselines").strip() or "Baselines",
         )
+        scraper_log_ws = get_or_create_worksheet(sh, config.scraper_log_sheet_name, rows=1000, cols=12)
+        ensure_scraper_log_headers(scraper_log_ws)
+        execution_id = datetime.now().strftime("%Y%m%d%H%M%S")
 
         processed_any_term = False
         monitoring_targets = get_monitoring_targets(
@@ -2607,9 +2691,11 @@ def main() -> int:
                 config=config,
                 data_ws=data_ws,
                 baseline_ws=baseline_ws,
+                scraper_log_ws=scraper_log_ws,
                 search_keyword=keyword,
                 alert_chat_id=chat_id,
                 item_blacklist_terms=scoped_blacklist_terms,
+                execution_id=execution_id,
             )
             processed_any_term = processed_any_term or processed
 
