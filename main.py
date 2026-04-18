@@ -137,8 +137,6 @@ class AppConfig:
     google_sheet_id: str
     data_sheet_name: str
     price_log_sheet_name: str
-    daily_log_sheet_name: str
-    found_log_sheet_name: str
     target_sheet_name: str
     scraper_log_sheet_name: str
     telegram_token: str
@@ -579,8 +577,6 @@ def load_config() -> AppConfig:
         google_sheet_id=google_sheet_id,
         data_sheet_name=os.getenv("DATA_SHEET_NAME", "Historico").strip(),
         price_log_sheet_name=os.getenv("PRICE_LOG_SHEET_NAME", "LogPrecoProduto").strip() or "LogPrecoProduto",
-        daily_log_sheet_name=os.getenv("DAILY_LOG_SHEET_NAME", "LogDiario").strip() or "LogDiario",
-        found_log_sheet_name=os.getenv("FOUND_LOG_SHEET_NAME", "LOG").strip() or "LOG",
         target_sheet_name=os.getenv("TARGET_SHEET_NAME", "PrecosAlvo").strip(),
         scraper_log_sheet_name=os.getenv("SCRAPER_LOG_SHEET_NAME", "LogScraper").strip() or "LogScraper",
         telegram_token=telegram_token,
@@ -1899,55 +1895,6 @@ def append_price_log_row(price_log_ws, row: List[Any]) -> None:
     price_log_ws.append_row(row, value_input_option="USER_ENTERED")
 
 
-def ensure_daily_log_headers(daily_log_ws) -> None:
-    expected_headers = [
-        "Data/Hora",
-        "Chat_ID",
-        "Termo Buscado",
-        "Nome do Produto",
-        "Marketplace",
-        "Preco",
-        "Link",
-    ]
-    current_headers = daily_log_ws.row_values(1)
-    if current_headers != expected_headers:
-        daily_log_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
-
-
-def append_daily_log_row(daily_log_ws, row: List[Any]) -> None:
-    if daily_log_ws is None or not row:
-        return
-
-    ensure_daily_log_headers(daily_log_ws)
-    daily_log_ws.append_row(row, value_input_option="USER_ENTERED")
-
-
-def ensure_found_log_headers(found_log_ws) -> None:
-    expected_headers = [
-        "Data/Hora",
-        "Execucao_ID",
-        "Chat_ID",
-        "Termo Buscado",
-        "Marketplace",
-        "Pagina",
-        "Titulo",
-        "Preco",
-        "URL",
-        "Imagem",
-    ]
-    current_headers = found_log_ws.row_values(1)
-    if current_headers != expected_headers:
-        found_log_ws.update("A1:J1", [expected_headers], value_input_option="USER_ENTERED")
-
-
-def append_found_log_row(found_log_ws, row: List[Any]) -> None:
-    if found_log_ws is None or not row:
-        return
-
-    ensure_found_log_headers(found_log_ws)
-    found_log_ws.append_row(row, value_input_option="USER_ENTERED")
-
-
 def ensure_target_headers(target_ws) -> None:
     expected_headers = [
         "Chat_ID",
@@ -2598,8 +2545,6 @@ def daily_monitor(
     config: AppConfig,
     data_ws,
     price_log_ws,
-    daily_log_ws,
-    found_log_ws,
     baseline_ws,
     scraper_log_ws,
     search_keyword: str,
@@ -2705,48 +2650,6 @@ def daily_monitor(
     winner_store = str(global_df.loc[winner_idx, "store"])
     winner_image_url = str(global_df.loc[winner_idx, "image_url"] or "").strip() or None
 
-    winner_page = ""
-    normalized_winner_url = normalize_url(winner_url)
-    for row in log_rows:
-        if not isinstance(row, list) or len(row) < 12:
-            continue
-        row_marketplace = str(row[4] or "").strip().lower()
-        row_page = row[5]
-        row_url = normalize_url(str(row[8] or ""))
-        row_passed_final = str(row[11] or "").strip().lower() == "sim"
-        if row_marketplace == winner_store.lower() and row_url == normalized_winner_url and row_passed_final:
-            winner_page = row_page
-            break
-
-    append_found_log_row(
-        found_log_ws,
-        [
-            now_brt_str(),
-            execution_id,
-            str(alert_chat_id or "").strip(),
-            search_keyword,
-            winner_store,
-            winner_page,
-            winner_title,
-            winner_price,
-            winner_url,
-            winner_image_url or "",
-        ],
-    )
-
-    append_daily_log_row(
-        daily_log_ws,
-        [
-            now_brt_str(),
-            str(alert_chat_id or "").strip(),
-            search_keyword,
-            winner_title,
-            winner_store,
-            winner_price,
-            winner_url,
-        ],
-    )
-
     baseline_discount = 0.0
     if baseline_median > 0:
         baseline_discount = (baseline_median - winner_price) / baseline_median
@@ -2840,10 +2743,6 @@ def main() -> int:
         ensure_history_headers(data_ws)
         price_log_ws = get_or_create_worksheet(sh, config.price_log_sheet_name, rows=2000, cols=11)
         ensure_price_log_headers(price_log_ws)
-        daily_log_ws = get_or_create_worksheet(sh, config.daily_log_sheet_name, rows=2000, cols=7)
-        ensure_daily_log_headers(daily_log_ws)
-        found_log_ws = get_or_create_worksheet(sh, config.found_log_sheet_name, rows=2000, cols=10)
-        ensure_found_log_headers(found_log_ws)
         target_ws = get_or_create_worksheet(sh, config.target_sheet_name)
         ensure_target_headers(target_ws)
         baseline_ws = get_or_create_worksheet(
@@ -2944,8 +2843,6 @@ def main() -> int:
                 config=config,
                 data_ws=data_ws,
                 price_log_ws=price_log_ws,
-                daily_log_ws=daily_log_ws,
-                found_log_ws=found_log_ws,
                 baseline_ws=baseline_ws,
                 scraper_log_ws=scraper_log_ws,
                 search_keyword=keyword,
@@ -2969,101 +2866,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-def _parse_log_datetime(raw_value: str) -> Optional[datetime]:
-    raw = str(raw_value or "").strip()
-    if not raw:
-        return None
-
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(raw, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def _clear_daily_log_sheet(daily_log_ws) -> None:
-    daily_log_ws.clear()
-    ensure_daily_log_headers(daily_log_ws)
-
-
-def enviar_resumo_diario() -> int:
-    try:
-        config = load_config()
-        sh = open_spreadsheet(config)
-        daily_log_ws = get_or_create_worksheet(sh, config.daily_log_sheet_name, rows=2000, cols=7)
-        ensure_daily_log_headers(daily_log_ws)
-
-        rows = daily_log_ws.get_all_records()
-        if not rows:
-            logger.info("Resumo diário: sem registros no LogDiario.")
-            return 0
-
-        cutoff = datetime.now() - timedelta(hours=24)
-        grouped: Dict[str, Dict[str, Dict[str, Any]]] = {}
-
-        for row in rows:
-            chat_id = str(row.get("Chat_ID", "") or "").strip()
-            term = str(row.get("Termo Buscado", "") or "").strip()
-            product = str(row.get("Nome do Produto", "") or "").strip() or term
-            marketplace = str(row.get("Marketplace", "") or "").strip()
-            link = str(row.get("Link", "") or "").strip()
-            price = safe_float(row.get("Preco"))
-            dt = _parse_log_datetime(str(row.get("Data/Hora", "") or ""))
-
-            if not chat_id or not term or price is None:
-                continue
-            if dt is not None and dt < cutoff:
-                continue
-
-            chat_bucket = grouped.setdefault(chat_id, {})
-            key = normalize_text(term)
-            existing = chat_bucket.get(key)
-            candidate = {
-                "term": term,
-                "product": product,
-                "marketplace": marketplace,
-                "price": float(price),
-                "link": link,
-            }
-
-            if existing is None or candidate["price"] < existing["price"]:
-                chat_bucket[key] = candidate
-
-        if not grouped:
-            logger.info("Resumo diário: sem itens nas últimas 24h para envio.")
-            return 0
-
-        all_sent = True
-        for chat_id, items in grouped.items():
-            lines = ["📅 Seu Resumo de Ofertas das Últimas 24h", ""]
-            for item in sorted(items.values(), key=lambda x: x["price"]):
-                lines.append(
-                    f"• {item['product']} ({item['marketplace'] or 'loja não informada'})\n"
-                    f"  Menor preço: R$ {brl(item['price'])}\n"
-                    f"  Link: {item['link'] or 'indisponível'}"
-                )
-
-            try:
-                send_telegram_message(
-                    token=config.telegram_token,
-                    chat_id=chat_id,
-                    message="\n".join(lines),
-                )
-            except Exception as exc:
-                all_sent = False
-                logger.error("Falha ao enviar resumo diário para chat_id=%s: %s", chat_id, exc)
-
-        if all_sent:
-            _clear_daily_log_sheet(daily_log_ws)
-            logger.info("Resumo diário enviado com sucesso e LogDiario limpo.")
-            return 0
-
-        logger.warning("Resumo diário enviado parcialmente. LogDiario mantido para nova tentativa.")
-        return 1
-
-    except Exception as exc:
-        logger.exception("Falha ao enviar resumo diário: %s", exc)
-        return 1
