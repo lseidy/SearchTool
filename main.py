@@ -138,6 +138,7 @@ class AppConfig:
     data_sheet_name: str
     price_log_sheet_name: str
     daily_log_sheet_name: str
+    found_log_sheet_name: str
     target_sheet_name: str
     scraper_log_sheet_name: str
     telegram_token: str
@@ -579,6 +580,7 @@ def load_config() -> AppConfig:
         data_sheet_name=os.getenv("DATA_SHEET_NAME", "Historico").strip(),
         price_log_sheet_name=os.getenv("PRICE_LOG_SHEET_NAME", "LogPrecoProduto").strip() or "LogPrecoProduto",
         daily_log_sheet_name=os.getenv("DAILY_LOG_SHEET_NAME", "LogDiario").strip() or "LogDiario",
+        found_log_sheet_name=os.getenv("FOUND_LOG_SHEET_NAME", "LOG").strip() or "LOG",
         target_sheet_name=os.getenv("TARGET_SHEET_NAME", "PrecosAlvo").strip(),
         scraper_log_sheet_name=os.getenv("SCRAPER_LOG_SHEET_NAME", "LogScraper").strip() or "LogScraper",
         telegram_token=telegram_token,
@@ -1920,6 +1922,32 @@ def append_daily_log_row(daily_log_ws, row: List[Any]) -> None:
     daily_log_ws.append_row(row, value_input_option="USER_ENTERED")
 
 
+def ensure_found_log_headers(found_log_ws) -> None:
+    expected_headers = [
+        "Data/Hora",
+        "Execucao_ID",
+        "Chat_ID",
+        "Termo Buscado",
+        "Marketplace",
+        "Pagina",
+        "Titulo",
+        "Preco",
+        "URL",
+        "Imagem",
+    ]
+    current_headers = found_log_ws.row_values(1)
+    if current_headers != expected_headers:
+        found_log_ws.update("A1:J1", [expected_headers], value_input_option="USER_ENTERED")
+
+
+def append_found_log_row(found_log_ws, row: List[Any]) -> None:
+    if found_log_ws is None or not row:
+        return
+
+    ensure_found_log_headers(found_log_ws)
+    found_log_ws.append_row(row, value_input_option="USER_ENTERED")
+
+
 def ensure_target_headers(target_ws) -> None:
     expected_headers = [
         "Chat_ID",
@@ -2571,6 +2599,7 @@ def daily_monitor(
     data_ws,
     price_log_ws,
     daily_log_ws,
+    found_log_ws,
     baseline_ws,
     scraper_log_ws,
     search_keyword: str,
@@ -2675,6 +2704,35 @@ def daily_monitor(
     winner_title = str(global_df.loc[winner_idx, "title"])
     winner_store = str(global_df.loc[winner_idx, "store"])
     winner_image_url = str(global_df.loc[winner_idx, "image_url"] or "").strip() or None
+
+    winner_page = ""
+    normalized_winner_url = normalize_url(winner_url)
+    for row in log_rows:
+        if not isinstance(row, list) or len(row) < 12:
+            continue
+        row_marketplace = str(row[4] or "").strip().lower()
+        row_page = row[5]
+        row_url = normalize_url(str(row[8] or ""))
+        row_passed_final = str(row[11] or "").strip().lower() == "sim"
+        if row_marketplace == winner_store.lower() and row_url == normalized_winner_url and row_passed_final:
+            winner_page = row_page
+            break
+
+    append_found_log_row(
+        found_log_ws,
+        [
+            now_brt_str(),
+            execution_id,
+            str(alert_chat_id or "").strip(),
+            search_keyword,
+            winner_store,
+            winner_page,
+            winner_title,
+            winner_price,
+            winner_url,
+            winner_image_url or "",
+        ],
+    )
 
     append_daily_log_row(
         daily_log_ws,
@@ -2784,6 +2842,8 @@ def main() -> int:
         ensure_price_log_headers(price_log_ws)
         daily_log_ws = get_or_create_worksheet(sh, config.daily_log_sheet_name, rows=2000, cols=7)
         ensure_daily_log_headers(daily_log_ws)
+        found_log_ws = get_or_create_worksheet(sh, config.found_log_sheet_name, rows=2000, cols=10)
+        ensure_found_log_headers(found_log_ws)
         target_ws = get_or_create_worksheet(sh, config.target_sheet_name)
         ensure_target_headers(target_ws)
         baseline_ws = get_or_create_worksheet(
@@ -2885,6 +2945,7 @@ def main() -> int:
                 data_ws=data_ws,
                 price_log_ws=price_log_ws,
                 daily_log_ws=daily_log_ws,
+                found_log_ws=found_log_ws,
                 baseline_ws=baseline_ws,
                 scraper_log_ws=scraper_log_ws,
                 search_keyword=keyword,
