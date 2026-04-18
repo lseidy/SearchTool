@@ -1759,7 +1759,7 @@ def enviar_alerta_telegram(
     chat_id: str,
     produto: str,
     preco: float,
-    mediana: float,
+    preco_medio_referencia: float,
     desconto: float,
     link: str,
     image_url: Optional[str],
@@ -1776,7 +1776,7 @@ def enviar_alerta_telegram(
         "🎉 <b>Achado do Dia!</b>\n"
         f"🛒 <b>Produto:</b> <i>{safe_produto}</i>\n\n"
         f"💰 <b>Preço Agora:</b> R$ <b>{brl(preco)}</b>\n"
-        f"📉 <b>Preço Médio:</b> R$ <b>{brl(mediana)}</b>\n"
+        f"📉 <b>Preço Médio:</b> R$ <b>{brl(preco_medio_referencia)}</b>\n"
         f"🔥 <b>Desconto:</b> {discount_pct:.2f}% OFF!\n\n"
         f"🔗 <a href=\"{safe_link}\">Clique aqui para aproveitar!</a>"
     )
@@ -1919,10 +1919,11 @@ def ensure_baseline_headers(baseline_ws) -> None:
         "Preco Maximo",
         "Data Ultima Calibragem",
         "Mediana",
+        "Media Produtos",
     ]
     current_headers = baseline_ws.row_values(1)
     if current_headers != expected_headers:
-        baseline_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
+        baseline_ws.update("A1:H1", [expected_headers], value_input_option="USER_ENTERED")
 
 
 def ensure_scraper_log_headers(log_ws) -> None:
@@ -2024,13 +2025,16 @@ def upsert_market_baseline(
     calibration_timestamp: str,
     chat_id: str = "GLOBAL",
     median: Optional[float] = None,
+    products_mean: Optional[float] = None,
 ) -> None:
     ensure_baseline_headers(baseline_ws)
     row_index, _ = get_baseline_for_keyword(baseline_ws, search_keyword, marketplace, chat_id=chat_id)
     price_min_rounded = round(float(price_min), 2)
     price_max_rounded = round(float(price_max), 2)
     median_value = float(median) if median is not None else ((price_min_rounded / 0.50 + price_max_rounded / 1.10) / 2)
+    products_mean_value = float(products_mean) if products_mean is not None else float(median_value)
     median_rounded = round(median_value, 2)
+    products_mean_rounded = round(products_mean_value, 2)
     payload = [
         chat_id,
         search_keyword,
@@ -2039,6 +2043,7 @@ def upsert_market_baseline(
         f"{price_max_rounded:.2f}",
         calibration_timestamp,
         f"{median_rounded:.2f}",
+        f"{products_mean_rounded:.2f}",
     ]
 
     if row_index is None:
@@ -2047,7 +2052,7 @@ def upsert_market_baseline(
         return
 
     baseline_ws.update(
-        f"A{row_index}:G{row_index}",
+        f"A{row_index}:H{row_index}",
         [payload],
         value_input_option="USER_ENTERED",
     )
@@ -2099,7 +2104,8 @@ def calibrate_market_baseline(
         logger.warning("Calibragem retornou DataFrame vazio para o termo: %s", search_keyword)
         return None
 
-    median_price = float(df["price"].median())
+    average_price = float(df["price"].mean())
+    mean_price = float(df["price"].mean())
     baseline_min = median_price * 0.50
     baseline_max = median_price * 1.10
     timestamp = now_brt_str()
@@ -2112,10 +2118,12 @@ def calibrate_market_baseline(
         price_max=baseline_max,
         calibration_timestamp=timestamp,
         median=median_price,
+        products_mean=mean_price,
     )
 
     return {
         "median": median_price,
+        "mean": mean_price,
         "min": baseline_min,
         "max": baseline_max,
     }
@@ -2170,6 +2178,7 @@ def calibrate_global_market_baseline(
         return None
 
     median_price = float(df["price"].median())
+    mean_price = float(df["price"].mean())
     baseline_min = median_price * 0.50
     baseline_max = median_price * 1.10
     timestamp = now_brt_str()
@@ -2182,10 +2191,12 @@ def calibrate_global_market_baseline(
         price_max=baseline_max,
         calibration_timestamp=timestamp,
         median=median_price,
+        products_mean=mean_price,
     )
 
     return {
         "median": median_price,
+        "mean": mean_price,
         "min": baseline_min,
         "max": baseline_max,
     }
@@ -2218,7 +2229,7 @@ def process_products(
     min_idx = df["price"].idxmin()
     current_price = float(df.loc[min_idx, "price"])
     current_name = str(df.loc[min_idx, "name"])
-    median_price = float(df["price"].median())
+    average_price = float(df["price"].mean())
     current_link = str(df.loc[min_idx, "url"])
     current_image_url = str(df.loc[min_idx, "image_url"] or "").strip() or None
     timestamp = now_brt_str()
@@ -2239,13 +2250,14 @@ def process_products(
     historical_min = current_price
     previous_historical_min = None
 
+    if average_price > 0:
+        variation_pct = ((current_price - average_price) / average_price) * 100
+
     if existing_row is not None:
         previous_historical_min = safe_float(existing_row.get("Menor Preço Histórico"))
         if previous_historical_min is not None and previous_historical_min > 0:
-            variation_pct = ((current_price - previous_historical_min) / previous_historical_min) * 100
             historical_min = min(current_price, previous_historical_min)
         else:
-            variation_pct = 0.0
             historical_min = current_price
 
     payload = [
@@ -2253,7 +2265,7 @@ def process_products(
         search_keyword,
         current_name,
         current_price,
-        median_price,
+        average_price,
         historical_min,
         variation_pct,
         current_link,
@@ -2281,7 +2293,7 @@ def process_products(
             current_name,
             marketplace,
             current_price,
-            median_price,
+            average_price,
             historical_min,
             variation_pct,
             current_link,
@@ -2292,7 +2304,7 @@ def process_products(
     if enable_legacy_history_alert and existing_row is not None and variation_pct < 0:
         median_reference = safe_float(existing_row.get("Preço Médio"))
         if median_reference is None or median_reference <= 0:
-            median_reference = median_price
+            median_reference = average_price
 
         discount_pct = 0.0
         if median_reference and median_reference > 0:
@@ -2314,7 +2326,7 @@ def process_products(
                     chat_id=str(alert_chat_id or "").strip(),
                     produto=search_keyword,
                     preco=current_price,
-                    mediana=median_reference,
+                    preco_medio_referencia=median_reference,
                     desconto=discount_pct,
                     link=current_link,
                     image_url=current_image_url,
@@ -2563,6 +2575,9 @@ def daily_monitor(
     price_min = safe_float(baseline_row.get("Preco Minimo"))
     price_max = safe_float(baseline_row.get("Preco Maximo"))
     baseline_median = safe_float(baseline_row.get("Mediana"))
+    baseline_products_mean = safe_float(baseline_row.get("Media Produtos"))
+    if baseline_products_mean is None:
+        baseline_products_mean = safe_float(baseline_row.get("Média dos Produtos"))
 
     if baseline_median is None:
         baseline_median_candidates = []
@@ -2573,12 +2588,17 @@ def daily_monitor(
         if baseline_median_candidates:
             baseline_median = float(sum(baseline_median_candidates) / len(baseline_median_candidates))
 
+    if baseline_products_mean is None and baseline_median is not None:
+        baseline_products_mean = baseline_median
+
     if (
         price_min is None
         or price_max is None
         or baseline_median is None
+        or baseline_products_mean is None
         or price_max <= price_min
         or baseline_median <= 0
+        or baseline_products_mean <= 0
     ):
         logger.warning(
             "Baseline GLOBAL inválido para '%s'. Sem recalibração automática.",
@@ -2651,9 +2671,9 @@ def daily_monitor(
     winner_image_url = str(global_df.loc[winner_idx, "image_url"] or "").strip() or None
 
     baseline_discount = 0.0
-    if baseline_median > 0:
-        baseline_discount = (baseline_median - winner_price) / baseline_median
-    should_send_realtime_alert = winner_price <= (baseline_median * 0.90)
+    if baseline_products_mean > 0:
+        baseline_discount = (baseline_products_mean - winner_price) / baseline_products_mean
+    should_send_realtime_alert = winner_price <= (baseline_products_mean * 0.90)
 
     processed = process_products(
         config,
@@ -2672,7 +2692,7 @@ def daily_monitor(
             f"Loja: {winner_store}\n"
             f"Produto: {winner_title}\n"
             f"Preço: R$ {brl(winner_price)}\n"
-            f"Mediana baseline: R$ {brl(baseline_median)}\n"
+            f"Média baseline: R$ {brl(baseline_products_mean)}\n"
             f"Desconto: {baseline_discount * 100:.2f}%\n"
             f"Link: {winner_url}"
         )
@@ -2681,7 +2701,7 @@ def daily_monitor(
                 chat_id=str(alert_chat_id or "").strip(),
                 produto=winner_title,
                 preco=winner_price,
-                mediana=baseline_median,
+                preco_medio_referencia=baseline_products_mean,
                 desconto=baseline_discount,
                 link=winner_url,
                 image_url=winner_image_url,
