@@ -136,6 +136,8 @@ class AppConfig:
     min_price_threshold: float
     google_sheet_id: str
     data_sheet_name: str
+    price_log_sheet_name: str
+    daily_log_sheet_name: str
     target_sheet_name: str
     scraper_log_sheet_name: str
     telegram_token: str
@@ -575,6 +577,8 @@ def load_config() -> AppConfig:
         min_price_threshold=min_price_threshold,
         google_sheet_id=google_sheet_id,
         data_sheet_name=os.getenv("DATA_SHEET_NAME", "Historico").strip(),
+        price_log_sheet_name=os.getenv("PRICE_LOG_SHEET_NAME", "LogPrecoProduto").strip() or "LogPrecoProduto",
+        daily_log_sheet_name=os.getenv("DAILY_LOG_SHEET_NAME", "LogDiario").strip() or "LogDiario",
         target_sheet_name=os.getenv("TARGET_SHEET_NAME", "PrecosAlvo").strip(),
         scraper_log_sheet_name=os.getenv("SCRAPER_LOG_SHEET_NAME", "LogScraper").strip() or "LogScraper",
         telegram_token=telegram_token,
@@ -1852,15 +1856,68 @@ def ensure_history_headers(data_ws) -> None:
     expected_headers = [
         "Data/Hora",
         "Termo Buscado",
+        "Nome do Produto",
         "Preço Atual",
         "Preço Médio",
         "Menor Preço Histórico",
         "Variação (%)",
         "Link do Menor Preço Atual",
+        "Imagem do Produto",
+        "Marketplace",
     ]
     current_headers = data_ws.row_values(1)
     if current_headers != expected_headers:
-        data_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
+        data_ws.update("A1:J1", [expected_headers], value_input_option="USER_ENTERED")
+
+
+def ensure_price_log_headers(price_log_ws) -> None:
+    expected_headers = [
+        "Data/Hora",
+        "Chat_ID",
+        "Termo Buscado",
+        "Nome do Produto",
+        "Marketplace",
+        "Preco Atual",
+        "Preco Medio",
+        "Menor Preco Historico",
+        "Variacao (%)",
+        "Link do Produto",
+        "Imagem do Produto",
+    ]
+    current_headers = price_log_ws.row_values(1)
+    if current_headers != expected_headers:
+        price_log_ws.update("A1:K1", [expected_headers], value_input_option="USER_ENTERED")
+
+
+def append_price_log_row(price_log_ws, row: List[Any]) -> None:
+    if price_log_ws is None or not row:
+        return
+
+    ensure_price_log_headers(price_log_ws)
+    price_log_ws.append_row(row, value_input_option="USER_ENTERED")
+
+
+def ensure_daily_log_headers(daily_log_ws) -> None:
+    expected_headers = [
+        "Data/Hora",
+        "Chat_ID",
+        "Termo Buscado",
+        "Nome do Produto",
+        "Marketplace",
+        "Preco",
+        "Link",
+    ]
+    current_headers = daily_log_ws.row_values(1)
+    if current_headers != expected_headers:
+        daily_log_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
+
+
+def append_daily_log_row(daily_log_ws, row: List[Any]) -> None:
+    if daily_log_ws is None or not row:
+        return
+
+    ensure_daily_log_headers(daily_log_ws)
+    daily_log_ws.append_row(row, value_input_option="USER_ENTERED")
 
 
 def ensure_target_headers(target_ws) -> None:
@@ -2149,7 +2206,7 @@ def calibrate_global_market_baseline(
         price_min=baseline_min,
         price_max=baseline_max,
         calibration_timestamp=timestamp,
-        median=global_median,
+        median=median_price,
     )
 
     return {
@@ -2165,6 +2222,9 @@ def process_products(
     products: List[Product],
     search_keyword: str,
     alert_chat_id: Optional[str] = None,
+    marketplace: str = "",
+    price_log_ws=None,
+    enable_legacy_history_alert: bool = False,
 ) -> bool:
     ensure_history_headers(data_ws)
 
@@ -2182,6 +2242,7 @@ def process_products(
 
     min_idx = df["price"].idxmin()
     current_price = float(df.loc[min_idx, "price"])
+    current_name = str(df.loc[min_idx, "name"])
     median_price = float(df["price"].median())
     current_link = str(df.loc[min_idx, "url"])
     current_image_url = str(df.loc[min_idx, "image_url"] or "").strip() or None
@@ -2215,11 +2276,14 @@ def process_products(
     payload = [
         timestamp,
         search_keyword,
+        current_name,
         current_price,
         median_price,
         historical_min,
         variation_pct,
         current_link,
+        current_image_url or "",
+        marketplace,
     ]
 
     if existing_row_index is None:
@@ -2227,13 +2291,30 @@ def process_products(
         logger.info("Novo termo inserido no histórico: %s", search_keyword)
     else:
         data_ws.update(
-            f"A{existing_row_index}:G{existing_row_index}",
+            f"A{existing_row_index}:J{existing_row_index}",
             [payload],
             value_input_option="USER_ENTERED",
         )
         logger.info("Termo atualizado no histórico: %s", search_keyword)
 
-    if existing_row is not None and variation_pct < 0:
+    append_price_log_row(
+        price_log_ws,
+        [
+            timestamp,
+            str(alert_chat_id or "").strip(),
+            search_keyword,
+            current_name,
+            marketplace,
+            current_price,
+            median_price,
+            historical_min,
+            variation_pct,
+            current_link,
+            current_image_url or "",
+        ],
+    )
+
+    if enable_legacy_history_alert and existing_row is not None and variation_pct < 0:
         median_reference = safe_float(existing_row.get("Preço Médio"))
         if median_reference is None or median_reference <= 0:
             median_reference = median_price
@@ -2488,6 +2569,8 @@ def daily_monitor(
     scraper: MultiMarketplaceScraper,
     config: AppConfig,
     data_ws,
+    price_log_ws,
+    daily_log_ws,
     baseline_ws,
     scraper_log_ws,
     search_keyword: str,
@@ -2593,9 +2676,23 @@ def daily_monitor(
     winner_store = str(global_df.loc[winner_idx, "store"])
     winner_image_url = str(global_df.loc[winner_idx, "image_url"] or "").strip() or None
 
-    winner_discount = 0.0
-    if global_median > 0:
-        winner_discount = (global_median - winner_price) / global_median
+    append_daily_log_row(
+        daily_log_ws,
+        [
+            now_brt_str(),
+            str(alert_chat_id or "").strip(),
+            search_keyword,
+            winner_title,
+            winner_store,
+            winner_price,
+            winner_url,
+        ],
+    )
+
+    baseline_discount = 0.0
+    if baseline_median > 0:
+        baseline_discount = (baseline_median - winner_price) / baseline_median
+    should_send_realtime_alert = winner_price <= (baseline_median * 0.90)
 
     processed = process_products(
         config,
@@ -2603,16 +2700,19 @@ def daily_monitor(
         [Product(name=winner_title, price=winner_price, url=winner_url, image_url=winner_image_url)],
         search_keyword,
         alert_chat_id=alert_chat_id,
+        marketplace=winner_store,
+        price_log_ws=price_log_ws,
+        enable_legacy_history_alert=False,
     )
 
-    if winner_discount >= 0.10:
+    if should_send_realtime_alert:
         message = (
             f"🏆 Melhor oferta global para '{search_keyword}'!\n"
             f"Loja: {winner_store}\n"
             f"Produto: {winner_title}\n"
             f"Preço: R$ {brl(winner_price)}\n"
-            f"Mediana global: R$ {brl(global_median)}\n"
-            f"Desconto: {winner_discount * 100:.2f}%\n"
+            f"Mediana baseline: R$ {brl(baseline_median)}\n"
+            f"Desconto: {baseline_discount * 100:.2f}%\n"
             f"Link: {winner_url}"
         )
         if config.telegram_enabled:
@@ -2620,8 +2720,8 @@ def daily_monitor(
                 chat_id=str(alert_chat_id or "").strip(),
                 produto=winner_title,
                 preco=winner_price,
-                mediana=global_median,
-                desconto=winner_discount,
+                mediana=baseline_median,
+                desconto=baseline_discount,
                 link=winner_url,
                 image_url=winner_image_url,
             )
@@ -2630,9 +2730,9 @@ def daily_monitor(
             logger.info("Telegram desabilitado. Mensagem global gerada: %s", message)
     else:
         logger.info(
-            "Desconto global insuficiente para '%s': %.2f%% (< 10%%).",
+            "Desconto vs baseline insuficiente para '%s': %.2f%% (< 10%%).",
             search_keyword,
-            winner_discount * 100,
+            baseline_discount * 100,
         )
 
     return processed
@@ -2679,6 +2779,11 @@ def main() -> int:
         scraper = MultiMarketplaceScraper(build_browser_context)
         sh = open_spreadsheet(config)
         data_ws = get_or_create_worksheet(sh, config.data_sheet_name)
+        ensure_history_headers(data_ws)
+        price_log_ws = get_or_create_worksheet(sh, config.price_log_sheet_name, rows=2000, cols=11)
+        ensure_price_log_headers(price_log_ws)
+        daily_log_ws = get_or_create_worksheet(sh, config.daily_log_sheet_name, rows=2000, cols=7)
+        ensure_daily_log_headers(daily_log_ws)
         target_ws = get_or_create_worksheet(sh, config.target_sheet_name)
         ensure_target_headers(target_ws)
         baseline_ws = get_or_create_worksheet(
@@ -2778,6 +2883,8 @@ def main() -> int:
                 scraper=scraper,
                 config=config,
                 data_ws=data_ws,
+                price_log_ws=price_log_ws,
+                daily_log_ws=daily_log_ws,
                 baseline_ws=baseline_ws,
                 scraper_log_ws=scraper_log_ws,
                 search_keyword=keyword,
@@ -2801,3 +2908,101 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def _parse_log_datetime(raw_value: str) -> Optional[datetime]:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _clear_daily_log_sheet(daily_log_ws) -> None:
+    daily_log_ws.clear()
+    ensure_daily_log_headers(daily_log_ws)
+
+
+def enviar_resumo_diario() -> int:
+    try:
+        config = load_config()
+        sh = open_spreadsheet(config)
+        daily_log_ws = get_or_create_worksheet(sh, config.daily_log_sheet_name, rows=2000, cols=7)
+        ensure_daily_log_headers(daily_log_ws)
+
+        rows = daily_log_ws.get_all_records()
+        if not rows:
+            logger.info("Resumo diário: sem registros no LogDiario.")
+            return 0
+
+        cutoff = datetime.now() - timedelta(hours=24)
+        grouped: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        for row in rows:
+            chat_id = str(row.get("Chat_ID", "") or "").strip()
+            term = str(row.get("Termo Buscado", "") or "").strip()
+            product = str(row.get("Nome do Produto", "") or "").strip() or term
+            marketplace = str(row.get("Marketplace", "") or "").strip()
+            link = str(row.get("Link", "") or "").strip()
+            price = safe_float(row.get("Preco"))
+            dt = _parse_log_datetime(str(row.get("Data/Hora", "") or ""))
+
+            if not chat_id or not term or price is None:
+                continue
+            if dt is not None and dt < cutoff:
+                continue
+
+            chat_bucket = grouped.setdefault(chat_id, {})
+            key = normalize_text(term)
+            existing = chat_bucket.get(key)
+            candidate = {
+                "term": term,
+                "product": product,
+                "marketplace": marketplace,
+                "price": float(price),
+                "link": link,
+            }
+
+            if existing is None or candidate["price"] < existing["price"]:
+                chat_bucket[key] = candidate
+
+        if not grouped:
+            logger.info("Resumo diário: sem itens nas últimas 24h para envio.")
+            return 0
+
+        all_sent = True
+        for chat_id, items in grouped.items():
+            lines = ["📅 Seu Resumo de Ofertas das Últimas 24h", ""]
+            for item in sorted(items.values(), key=lambda x: x["price"]):
+                lines.append(
+                    f"• {item['product']} ({item['marketplace'] or 'loja não informada'})\n"
+                    f"  Menor preço: R$ {brl(item['price'])}\n"
+                    f"  Link: {item['link'] or 'indisponível'}"
+                )
+
+            try:
+                send_telegram_message(
+                    token=config.telegram_token,
+                    chat_id=chat_id,
+                    message="\n".join(lines),
+                )
+            except Exception as exc:
+                all_sent = False
+                logger.error("Falha ao enviar resumo diário para chat_id=%s: %s", chat_id, exc)
+
+        if all_sent:
+            _clear_daily_log_sheet(daily_log_ws)
+            logger.info("Resumo diário enviado com sucesso e LogDiario limpo.")
+            return 0
+
+        logger.warning("Resumo diário enviado parcialmente. LogDiario mantido para nova tentativa.")
+        return 1
+
+    except Exception as exc:
+        logger.exception("Falha ao enviar resumo diário: %s", exc)
+        return 1
