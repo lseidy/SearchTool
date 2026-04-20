@@ -1900,14 +1900,13 @@ def ensure_target_headers(target_ws) -> None:
         "Chat_ID",
         "Termo Buscado",
         "Marketplace",
-        "Preco Minimo",
-        "Preco Maximo",
         "Data Ultima Calibragem",
         "Blacklist",
+        "Ultimo_Preco_Alertado",
     ]
     current_headers = target_ws.row_values(1)
     if current_headers != expected_headers:
-        target_ws.update("A1:G1", [expected_headers], value_input_option="USER_ENTERED")
+        target_ws.update("A1:H1", [expected_headers], value_input_option="USER_ENTERED")
 
 
 def ensure_baseline_headers(baseline_ws) -> None:
@@ -2558,9 +2557,13 @@ def daily_monitor(
     data_ws,
     price_log_ws,
     baseline_ws,
+    target_ws,
     scraper_log_ws,
     search_keyword: str,
     alert_chat_id: str,
+    target_row_index: Optional[int] = None,
+    last_alerted_price: float = float("inf"),
+    last_alerted_price_col: Optional[int] = None,
     item_blacklist_terms: Optional[List[str]] = None,
     execution_id: str = "",
 ) -> bool:
@@ -2673,7 +2676,10 @@ def daily_monitor(
     baseline_discount = 0.0
     if baseline_products_mean > 0:
         baseline_discount = (baseline_products_mean - winner_price) / baseline_products_mean
-    should_send_realtime_alert = winner_price <= (baseline_products_mean * 0.90)
+    should_send_realtime_alert = (
+        winner_price <= (baseline_products_mean * 0.90)
+        and winner_price < float(last_alerted_price)
+    )
 
     processed = process_products(
         config,
@@ -2706,14 +2712,20 @@ def daily_monitor(
                 link=winner_url,
                 image_url=winner_image_url,
             )
+
+            if target_row_index and last_alerted_price_col:
+                target_ws.update_cell(target_row_index, last_alerted_price_col, f"{winner_price:.2f}")
+
             logger.info("Alerta GLOBAL enviado para '%s'.", search_keyword)
         else:
             logger.info("Telegram desabilitado. Mensagem global gerada: %s", message)
     else:
         logger.info(
-            "Desconto vs baseline insuficiente para '%s': %.2f%% (< 10%%).",
+            "Sem alerta para '%s': preco=%.2f | limite_90=%.2f | ultimo_alertado=%.2f.",
             search_keyword,
-            baseline_discount * 100,
+            winner_price,
+            baseline_products_mean * 0.90,
+            float(last_alerted_price),
         )
 
     return processed
@@ -2723,16 +2735,21 @@ def get_monitoring_targets(
     scraper: MultiMarketplaceScraper,
     target_ws,
     fallback_keywords: List[str],
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     ensure_target_headers(target_ws)
+    headers = target_ws.row_values(1)
+    last_alerted_price_col = _find_column_index(headers, ["Ultimo_Preco_Alertado"])
     rows = target_ws.get_all_records()
-    targets: List[Dict[str, str]] = []
+    targets: List[Dict[str, Any]] = []
     seen = set()
 
-    for row in rows:
+    for idx, row in enumerate(rows, start=2):
         chat_id = str(row.get("Chat_ID", "") or "").strip()
         term = str(row.get("Termo Buscado", "") or "").strip()
         blacklist = str(row.get("Blacklist", "") or "").strip()
+        ultimo_preco_alertado = safe_float(row.get("Ultimo_Preco_Alertado"))
+        if ultimo_preco_alertado is None:
+            ultimo_preco_alertado = float("inf")
         if not term:
             continue
 
@@ -2748,6 +2765,9 @@ def get_monitoring_targets(
                 "keyword": term,
                 "chat_id": chat_id,
                 "blacklist": blacklist,
+                "row_index": idx,
+                "last_alerted_price": ultimo_preco_alertado,
+                "last_alerted_price_col": last_alerted_price_col,
             }
         )
 
@@ -2791,6 +2811,9 @@ def main() -> int:
             keyword = target["keyword"]
             chat_id = str(target.get("chat_id", "") or "").strip()
             scoped_blacklist_terms = parse_item_blacklist(str(target.get("blacklist", "") or ""))
+            target_row_index = int(target.get("row_index") or 0)
+            last_alerted_price = float(target.get("last_alerted_price") or float("inf"))
+            last_alerted_price_col = target.get("last_alerted_price_col")
 
             # Mediana deve ser lida da aba Baselines.
             _, baseline_row = get_baseline_for_keyword(baseline_ws, keyword, "global", chat_id="GLOBAL")
@@ -2864,9 +2887,13 @@ def main() -> int:
                 data_ws=data_ws,
                 price_log_ws=price_log_ws,
                 baseline_ws=baseline_ws,
+                target_ws=target_ws,
                 scraper_log_ws=scraper_log_ws,
                 search_keyword=keyword,
                 alert_chat_id=chat_id,
+                target_row_index=target_row_index,
+                last_alerted_price=last_alerted_price,
+                last_alerted_price_col=last_alerted_price_col,
                 item_blacklist_terms=scoped_blacklist_terms,
                 execution_id=execution_id,
             )
