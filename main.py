@@ -2201,6 +2201,55 @@ def calibrate_global_market_baseline(
     }
 
 
+def collect_calibration_products_global(
+    scraper: MultiMarketplaceScraper,
+    config: AppConfig,
+    keyword: str,
+    item_blacklist_terms: Optional[List[str]] = None,
+) -> List[Product]:
+    """Collect calibration candidates from all stores, tolerating per-store failures."""
+    all_products: List[Product] = []
+
+    for marketplace in scraper.SITE_CONFIG.keys():
+        try:
+            raw_products = scraper.get_products(
+                marketplace=marketplace,
+                keyword=keyword,
+                limit=config.calibration_top_n,
+                price_min=None,
+                price_max=None,
+                sort_by_price=False,
+            )
+            if raw_products is None or not isinstance(raw_products, list):
+                raw_products = []
+
+            valid_products = filter_valid_products(
+                products=raw_products,
+                search_keyword=keyword,
+                min_price_threshold=config.min_price_threshold,
+                item_blacklist_terms=item_blacklist_terms,
+            )
+            if valid_products is None or not isinstance(valid_products, list):
+                valid_products = []
+
+            logger.info(
+                "Calibragem GLOBAL '%s' | loja=%s | validos=%d",
+                keyword,
+                marketplace,
+                len(valid_products),
+            )
+            all_products.extend(valid_products)
+        except Exception as exc:
+            logger.warning(
+                "Calibragem GLOBAL '%s' | loja=%s falhou. Ignorando loja nesta rodada: %s",
+                keyword,
+                marketplace,
+                exc,
+            )
+
+    return all_products
+
+
 def process_products(
     config: AppConfig,
     data_ws,
@@ -2839,23 +2888,12 @@ def main() -> int:
 
             # Fase 1: Auto-calibragem para itens novos (mediana ausente/zero em Baselines).
             if current_median is None or current_median <= 0:
-                calibration_pool: List[Product] = []
-                for marketplace in scraper.SITE_CONFIG.keys():
-                    products = scraper.get_products(
-                        marketplace=marketplace,
-                        keyword=keyword,
-                        limit=config.calibration_top_n,
-                        price_min=None,
-                        price_max=None,
-                        sort_by_price=False,
-                    )
-                    valid_products = filter_valid_products(
-                        products=products,
-                        search_keyword=keyword,
-                        min_price_threshold=config.min_price_threshold,
-                        item_blacklist_terms=scoped_blacklist_terms,
-                    )
-                    calibration_pool.extend(valid_products)
+                calibration_pool = collect_calibration_products_global(
+                    scraper=scraper,
+                    config=config,
+                    keyword=keyword,
+                    item_blacklist_terms=scoped_blacklist_terms,
+                )
 
                 if not calibration_pool:
                     logger.warning("Calibragem sem produtos válidos para '%s'.", keyword)
