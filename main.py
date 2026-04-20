@@ -2223,19 +2223,32 @@ def collect_calibration_products_global(
             if raw_products is None or not isinstance(raw_products, list):
                 raw_products = []
 
-            valid_products = filter_valid_products(
-                products=raw_products,
-                search_keyword=keyword,
-                min_price_threshold=config.min_price_threshold,
-                item_blacklist_terms=item_blacklist_terms,
-            )
-            if valid_products is None or not isinstance(valid_products, list):
-                valid_products = []
+            # get_products já retorna itens saneados (URL/preço/título). Aplicar novamente
+            # a validação estrita de título aqui pode zerar a lista indevidamente.
+            valid_products = [
+                p
+                for p in raw_products
+                if isinstance(p, Product)
+                and p.price >= config.min_price_threshold
+                and (
+                    not item_blacklist_terms
+                    or not contains_item_blacklist_keyword(p.name, item_blacklist_terms)
+                )
+            ]
+
+            # Fallback: se uma validação extra eliminar tudo, preserva os itens já saneados
+            # da loja (respeitando só o piso mínimo) para não perder calibragem global.
+            if not valid_products and raw_products:
+                valid_products = [
+                    p for p in raw_products
+                    if isinstance(p, Product) and p.price >= config.min_price_threshold
+                ]
 
             logger.info(
-                "Calibragem GLOBAL '%s' | loja=%s | validos=%d",
+                "Calibragem GLOBAL '%s' | loja=%s | recebidos=%d | consolidados=%d",
                 keyword,
                 marketplace,
+                len(raw_products),
                 len(valid_products),
             )
             all_products.extend(valid_products)
