@@ -934,6 +934,23 @@ def validate_title_match(keyword: str, title: str) -> bool:
     return all(token in title_tokens for token in required_tokens)
 
 
+def validar_titulo_estrito(titulo_alvo: str, titulo_encontrado: str, min_ratio: float = 0.80) -> bool:
+    """Valida se o encontrado cobre pelo menos min_ratio dos tokens do alvo."""
+    alvo_tokens = [token for token in normalize_text(titulo_alvo).split() if token]
+    encontrado_set = {token for token in normalize_text(titulo_encontrado).split() if token}
+
+    if not alvo_tokens:
+        return False
+
+    alvo_set = set(alvo_tokens)
+    if not alvo_set:
+        return False
+
+    matched = len(alvo_set & encontrado_set)
+    coverage = matched / len(alvo_set)
+    return coverage >= min_ratio
+
+
 def filter_valid_products(
     products: List[Product],
     search_keyword: str,
@@ -1906,7 +1923,7 @@ def ensure_target_headers(target_ws) -> None:
     ]
     current_headers = target_ws.row_values(1)
     if current_headers != expected_headers:
-        target_ws.update("A1:H1", [expected_headers], value_input_option="USER_ENTERED")
+        target_ws.update("A1:F1", [expected_headers], value_input_option="USER_ENTERED")
 
 
 def ensure_baseline_headers(baseline_ws) -> None:
@@ -2223,8 +2240,7 @@ def collect_calibration_products_global(
             if raw_products is None or not isinstance(raw_products, list):
                 raw_products = []
 
-            # get_products já retorna itens saneados (URL/preço/título). Aplicar novamente
-            # a validação estrita de título aqui pode zerar a lista indevidamente.
+            # Consolidação pré-mediana: só mantém itens válidos por blacklist + match estrito.
             valid_products = [
                 p
                 for p in raw_products
@@ -2234,15 +2250,8 @@ def collect_calibration_products_global(
                     not item_blacklist_terms
                     or not contains_item_blacklist_keyword(p.name, item_blacklist_terms)
                 )
+                and validar_titulo_estrito(keyword, p.name, min_ratio=0.80)
             ]
-
-            # Fallback: se uma validação extra eliminar tudo, preserva os itens já saneados
-            # da loja (respeitando só o piso mínimo) para não perder calibragem global.
-            if not valid_products and raw_products:
-                valid_products = [
-                    p for p in raw_products
-                    if isinstance(p, Product) and p.price >= config.min_price_threshold
-                ]
 
             logger.info(
                 "Calibragem GLOBAL '%s' | loja=%s | recebidos=%d | consolidados=%d",
